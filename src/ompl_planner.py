@@ -1,0 +1,368 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+import mujoco
+
+try:
+    from ompl import base as ob
+    from ompl import geometric as og
+except ImportError as e:
+    raise ImportError(
+        "OMPL Python bindings are not installed or not importable. "
+        "Install OMPL and make sure 'from ompl import base, geometric' works."
+    ) from e
+
+
+@dataclass
+class OMPLConfig:
+    planner_name: str = "BITstar"
+    fragile_planner_name: str = "BITstar"
+    time_limit: float = 2.0
+    state_validity_resolution: float = 0.005
+    sampler_range: float = 0.08
+    waypoint_step: float = 0.015
+    goal_tolerance: float = 1e-3
+
+
+class PandaOMPLPlanner:
+    """
+    Joint-space OMPL planner for the 7-DoF Franka Panda in MuJoCo.
+
+    Planned state:
+        q = [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+
+    Collision model:
+        - checks robot vs environment contacts in MuJoCo
+        - environment = all non-robot bodies by default
+        - optional ignored_body_names lets you exclude the grasp target
+          during a specific planning phase
+    """
+
+    DEFAULT_ROBOT_BODIES = [
+        "link0", "link1", "link2", "link3", "link4", "link5", "link6", "link7",
+        "hand", "left_finger", "right_finger",
+    ]
+
+    DEFAULT_ARM_JOINTS = [f"joint{i}" for i in range(1, 8)]
+
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        data: mujoco.MjData,
+        config: Optional[OMPLConfig] = None,
+        robot_body_names: Optional[Sequence[str]] = None,
+    ):
+        self.model = model
+        self.live_data = data
+        self.cfg = config or OMPLConfig()
+
+        self.robot_body_names: Set[str] = set(robot_body_names or self.DEFAULT_ROBOT_BODIES)
+        self.arm_joint_names: List[str] = list(self.DEFAULT_ARM_JOINTS)
+
+        self.arm_qpos_adr = np.array(
+            [self.model.joint(n).qposadr[0] for n in self.arm_joint_names],
+            dtype=int,
+        )
+        self.arm_ranges = np.array(
+            [self.model.joint(n).range for n in self.arm_joint_names],
+            dtype=float,
+        )
+
+        self.ndof = len(self.arm_joint_names)
+        self.lower = self.arm_ranges[:, 0].copy()
+        self.upper = self.arm_ranges[:, 1].copy()
+
+        # Internal planning data: never mutate the live sim state during planning.
+        self.plan_data = mujoco.MjData(self.model)
+        self._sync_from_live_data()
+
+        # OMPL state space
+        self.space = ob.RealVectorStateSpace(self.ndof)
+        bounds = ob.RealVectorBounds(self.ndof)
+        for i in range(self.ndof):
+            bounds.setLow(i, float(self.lower[i]))
+            bounds.setHigh(i, float(self.upper[i]))
+        self.space.setBounds(bounds)
+
+        self.ssi = ob.SpaceInformation(self.space)
+        self.ssi.setStateValidityCheckingResolution(self.cfg.state_validity_resolution)
+        self.ssi.setStateValidityChecker(self._is_state_valid)
+
+        self._ignored_body_names: Set[str] = set()
+        self._refresh_collision_sets()
+
+        # Set by plan() before each solve so the validity checker can
+        # exempt the start state (the live arm configuration is always
+        # physically realised and must never be rejected by OMPL).
+        self._planning_start_q: Optional[np.ndarray] = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def sync_live_data(self, data: mujoco.MjData) -> None:
+        """Call this before planning if the simulation state has changed."""
+        self.live_data = data
+        self._sync_from_live_data()
+
+    def plan(
+        self,
+        start_q: Sequence[float],
+        goal_q: Sequence[float],
+        time_limit: Optional[float] = None,
+        planner_name: Optional[str] = None,
+        ignored_body_names: Optional[Sequence[str]] = None,
+        simplify: bool = True,
+        fragile_mode: bool = False,
+    ) -> Tuple[Optional[np.ndarray], dict]:
+        """
+        Plan a collision-free joint trajectory from start_q to goal_q.
+
+        Returns:
+            (trajectory, info)
+            trajectory: np.ndarray of shape (N, 7) or None
+            info: dict with metadata
+        """
+        start_q = np.asarray(start_q, dtype=float).reshape(-1)
+        goal_q = np.asarray(goal_q, dtype=float).reshape(-1)
+
+        if start_q.shape[0] != self.ndof or goal_q.shape[0] != self.ndof:
+            raise ValueError(f"Expected {self.ndof}-D q vectors, got {start_q.shape} and {goal_q.shape}")
+
+        # Update live scene snapshot used by the collision checker.
+        self._sync_from_live_data()
+
+        if ignored_body_names is not None:
+            self._ignored_body_names = set(ignored_body_names)
+        else:
+            self._ignored_body_names = set()
+
+        self._refresh_collision_sets()
+
+        # Record the start configuration BEFORE setStartAndGoalStates() is
+        # called so that _is_state_valid can exempt it unconditionally.
+        # The live arm state is physically realised and must never be rejected.
+        self._planning_start_q = start_q.copy()
+
+        ss = og.SimpleSetup(self.space)
+        ss.setStateValidityChecker(self._is_state_valid)
+        ss.getSpaceInformation().setStateValidityCheckingResolution(self.cfg.state_validity_resolution)
+
+        start = self.space.allocState()
+        goal  = self.space.allocState()
+        for i in range(self.ndof):
+            start[i] = float(start_q[i])
+            goal[i]  = float(goal_q[i])
+
+        ss.setStartAndGoalStates(start, goal, self.cfg.goal_tolerance)
+        # Note: states allocated via allocState() are copied by SimpleSetup.
+        # Python bindings do not expose freeState on RealVectorStateSpace,
+        # so we accept the tiny per-call allocation (56 bytes) without freeing.
+
+        planner_choice = (
+            planner_name
+            if planner_name is not None
+            else (self.cfg.fragile_planner_name if fragile_mode else self.cfg.planner_name)
+        )
+
+        planner = self._make_planner(
+            ss.getSpaceInformation(),
+            planner_name=planner_choice,
+            fragile_mode=fragile_mode,
+        )
+        ss.setPlanner(planner)
+
+        solve_time = float(time_limit if time_limit is not None else self.cfg.time_limit)
+        solved = ss.solve(solve_time)
+
+        planner_used = (
+           self.cfg.fragile_planner_name if fragile_mode
+           else (planner_name or self.cfg.planner_name)
+        )
+
+        info = {
+            "solved": bool(solved),
+            "planner_name": planner_used,
+            "time_limit": solve_time,
+            "ignored_body_names": sorted(list(self._ignored_body_names)),
+            "start_q": start_q.tolist(),
+            "goal_q": goal_q.tolist(),
+        }
+
+        if not solved:
+            return None, info
+
+        if simplify:
+            try:
+                ss.simplifySolution()
+            except Exception:
+                # Simplification is optional; ignore if the binding/version differs.
+                pass
+
+        path = ss.getSolutionPath()
+        raw = self._extract_path(path)
+        dense = self._densify_path(raw, step=self.cfg.waypoint_step)
+
+        info["num_waypoints"] = int(dense.shape[0])
+        info["path_length_joint_space"] = float(self._path_length(dense))
+        return dense, info
+
+    def is_state_valid_q(self, q: Sequence[float]) -> bool:
+        """Direct validity check for a 7-DoF joint vector."""
+        q = np.asarray(q, dtype=float).reshape(-1)
+        if q.shape[0] != self.ndof:
+            return False
+        return self._is_state_valid(self._q_to_state(q))
+
+    # ------------------------------------------------------------------
+    # OMPL helpers
+    # ------------------------------------------------------------------
+
+    def _make_planner(self, si: ob.SpaceInformation, planner_name: str, fragile_mode: bool = False):
+        if fragile_mode:
+            # Prefer a more conservative planner for fragile scenes.
+            planner = og.BITstar(si)
+            if hasattr(planner, "setRange"):
+                try:
+                    planner.setRange(float(min(self.cfg.sampler_range, 0.06)))
+                except Exception:
+                    pass
+            return planner
+
+        name = planner_name.strip().lower()
+
+        if name in {"rrtconnect", "rrt_connect"}:
+            planner = og.RRTConnect(si)
+        elif name in {"rrtstar", "rrt_star"}:
+            planner = og.RRTstar(si)
+        elif name in {"bitstar", "bit_star", "bit*"}:
+            planner = og.BITstar(si)
+        elif name in {"prmstar", "prm_star", "prm*"}:
+            planner = og.PRMstar(si)
+        elif name in {"kpiece", "kpiece1"}:
+            planner = og.KPIECE1(si)
+        elif name in {"est"}:
+            planner = og.EST(si)
+        else:
+            raise ValueError(f"Unsupported OMPL planner_name: {planner_name}")
+
+        if hasattr(planner, "setRange"):
+            try:
+                planner.setRange(float(self.cfg.sampler_range))
+            except Exception:
+                pass
+
+        return planner
+
+    def _q_to_state(self, q: np.ndarray):
+        state = self.space.allocState()
+        for i in range(self.ndof):
+            state[i] = float(q[i])
+        return state
+
+    def _state_to_q(self, state) -> np.ndarray:
+        return np.array([float(state[i]) for i in range(self.ndof)], dtype=float)
+
+    def _extract_path(self, path) -> np.ndarray:
+        n = int(path.getStateCount())
+        waypoints = np.zeros((n, self.ndof), dtype=float)
+        for i in range(n):
+            waypoints[i] = self._state_to_q(path.getState(i))
+        return waypoints
+
+    def _densify_path(self, waypoints: np.ndarray, step: float = 0.03) -> np.ndarray:
+        if waypoints.shape[0] <= 1:
+            return waypoints.copy()
+
+        dense = [waypoints[0].copy()]
+        for a, b in zip(waypoints[:-1], waypoints[1:]):
+            dist = float(np.linalg.norm(b - a))
+            n = max(1, int(np.ceil(dist / max(step, 1e-6))))
+            for k in range(1, n + 1):
+                alpha = k / n
+                dense.append((1.0 - alpha) * a + alpha * b)
+        return np.asarray(dense, dtype=float)
+
+    def _path_length(self, waypoints: np.ndarray) -> float:
+        if waypoints.shape[0] <= 1:
+            return 0.0
+        diffs = np.diff(waypoints, axis=0)
+        return float(np.sum(np.linalg.norm(diffs, axis=1)))
+
+    # ------------------------------------------------------------------
+    # Collision checking
+    # ------------------------------------------------------------------
+
+    def _sync_from_live_data(self) -> None:
+        self.plan_data.qpos[:] = self.live_data.qpos[:]
+        self.plan_data.qvel[:] = self.live_data.qvel[:]
+        mujoco.mj_forward(self.model, self.plan_data)
+
+    def _refresh_collision_sets(self) -> None:
+        # Collect geoms belonging to robot bodies.
+        self.robot_geom_ids: Set[int] = set()
+        self.env_geom_ids: Set[int] = set()
+
+        for gid in range(self.model.ngeom):
+            bid = int(self.model.geom_bodyid[gid])
+            body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
+            if body_name is None:
+                continue
+
+            if body_name in self.robot_body_names:
+                self.robot_geom_ids.add(gid)
+            elif body_name not in self._ignored_body_names:
+                self.env_geom_ids.add(gid)
+
+    def _is_state_valid(self, state) -> bool:
+        q = self._state_to_q(state)
+
+        # The planning start state is the live arm configuration — it is
+        # physically realised and must never be rejected regardless of any
+        # contacts that IK may have left behind.  All waypoints and the goal
+        # still get the full collision check.
+        if (self._planning_start_q is not None
+                and np.allclose(q, self._planning_start_q, atol=1e-4)):
+            return True
+
+        # Joint limits check
+        if np.any(q < (self.lower - 1e-9)) or np.any(q > (self.upper + 1e-9)):
+            return False
+
+        # Write candidate joint state into the planning copy of the sim.
+        self.plan_data.qpos[:] = self.live_data.qpos[:]
+        self.plan_data.qvel[:] = 0.0
+        self.plan_data.qpos[self.arm_qpos_adr] = q
+        mujoco.mj_forward(self.model, self.plan_data)
+
+        # Collision check: any robot-environment contact → invalid.
+        for i in range(self.plan_data.ncon):
+            con = self.plan_data.contact[i]
+            g1 = int(con.geom1)
+            g2 = int(con.geom2)
+
+            g1_robot = g1 in self.robot_geom_ids
+            g2_robot = g2 in self.robot_geom_ids
+            g1_env   = g1 in self.env_geom_ids
+            g2_env   = g2 in self.env_geom_ids
+
+            if (g1_robot and g2_env) or (g2_robot and g1_env):
+                return False
+
+        return True
+
+
+def make_default_panda_planner(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    planner_name: str = "BITstar",
+    time_limit: float = 2.0,
+) -> PandaOMPLPlanner:
+    return PandaOMPLPlanner(
+        model=model,
+        data=data,
+        config=OMPLConfig(planner_name=planner_name, time_limit=time_limit),
+    )

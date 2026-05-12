@@ -32,13 +32,13 @@ These are as seen from the standard camera view (azimuth 120°, elevation -30°)
   "left side"   →  positive-Y region  (y > +0.15)
   "far side"    →  positive-X region  (x > +0.20)
   "near side"   →  negative-X / low-X region
-  "tidy up"     →  arrange all cubes into a neat grid of parallel rows.
-                   Each row runs along the Y axis; rows are spaced ~0.15 m apart
-                   along X. Cubes within each row are spaced ~0.12 m apart along Y.
-                   Distribute cubes as evenly as possible (e.g. 4+3 for 7 cubes).
-                   Every gap — within a row and between rows — should be
-                   approximately equal. Keep the grid in a compact central region
-                   (x ≈ 0.05 - 0.25, |y| ≤ 0.40) so all positions stay reachable.
+  "tidy up"     →  arrange all cubes into this FIXED 2-row grid. These coordinates
+                   are pre-verified safe — do NOT recompute or change them:
+                     Row 1 (x=0.30):  y = -0.18, -0.06,  0.06,  0.18   (4 slots)
+                     Row 2 (x=0.41):  y = -0.12,  0.00,  0.12          (3 slots)
+                   All 7 slots are ≥ 0.125 m apart and within arm reach.
+                   Your job: assign cubes to these fixed slots, detect blockers,
+                   and order picks (Steps 2-4 below). No geometry needed.
 
 == ARM REACH CONSTRAINT ==
 - Minimum reach from base: 0.30 m
@@ -48,10 +48,9 @@ These are as seen from the standard camera view (azimuth 120°, elevation -30°)
     0.30 ≤ dist ≤ 0.82
   Show each calculation in your reasoning. A position that fails this check
   will be physically rejected and force a costly replan round.
-- Practical tip for fitting many cubes: keep x around 0.05-0.25 and
-  keep |y| ≤ 0.40 to stay safely inside the 0.82 m envelope.
-  For 7 cubes always use a 2-row grid (4+3) — a single column will put
-  the outer cubes out of reach.
+- For "tidy up": always use the exact fixed grid above — never redesign it.
+  For other goals: keep x ∈ [0.05, 0.40] and |y| ≤ 0.35. For 7+ cubes
+  use a 2-row layout so outer slots stay within the 0.82 m reach limit.
 
 == TABLE BOUNDS ==
 Valid placement x: [-0.55, 0.55]
@@ -63,10 +62,13 @@ Only two actions exist:
   place(x, y)    — the arm sets the held cube down at world position (x, y)
                    on the table. Z is always the table surface; omit it.
 
-== PICK ORDER STRATEGY — follow these 3 steps before writing any plan ==
+== PICK ORDER STRATEGY — follow these 4 steps before writing any plan ==
 
 STEP 1 — Design the target grid:
-  Assign each cube a target slot (x, y). Write out "cubeN → (x, y)" for every cube.
+  For "tidy up": use the exact 7-slot fixed grid from above (Row 1 x=0.30,
+  Row 2 x=0.41). Assign each cube to one slot. Do not change the coordinates.
+  For other goals: choose target (x, y) for each cube freely.
+  Write out "cubeN → (x, y)" for every cube.
 
 STEP 2 — Identify blocking cubes:
   For every target slot S, check EVERY cube in BOTH current_scene.objects AND
@@ -84,6 +86,17 @@ STEP 3 — Order picks so blocking cubes go first:
   would land within 0.20 m of where the blocking cube currently sits.
   After a blocking cube is moved, its old position is free — subsequent
   placements near that location are safe.
+
+STEP 4 — Final simulation check (MANDATORY — do not skip):
+  Trace through your plan step by step in order. Maintain a running list
+  of cubes still on the table (start with all, remove each when picked).
+  For EVERY "place" action, check the placement (x, y) against EVERY cube
+  in the running list (cubes not yet picked at that point in the plan).
+  Compute each distance explicitly: dist = sqrt((px-cx)^2 + (py-cy)^2).
+  If any distance < 0.10 m, the plan is INVALID — either move that cube
+  earlier in the pick order or choose a different slot before writing the
+  final plan. This step catches all violations before execution; skipping
+  it causes a costly drop-and-replan cycle.
 
 EXAMPLE — how to apply this:
   Suppose cube4 is currently at (0.15, -0.25) and you plan slot S = (0.10, -0.24).
@@ -115,8 +128,8 @@ EXAMPLE — how to apply this:
    - If a place was out of reach, choose a reachable alternative.
    - If a cube ended up at a wrong location, plan to pick it from its actual
      reported location.
-8. CRITICAL: You MUST complete the PICK ORDER STRATEGY (Steps 1-3) in your
-   reasoning before writing the plan. Skipping Step 2 is the single most common
+8. CRITICAL: You MUST complete the PICK ORDER STRATEGY (Steps 1-4) in your
+   reasoning before writing the plan. Skipping Step 4 is the single most common
    cause of proximity-rejection failures, which waste pick-and-drop cycles and
    prevent the goal from being reached.
 
@@ -124,7 +137,7 @@ EXAMPLE — how to apply this:
 Respond with valid JSON only — no markdown, no extra text.
 
 {
-  "reasoning": "<Step 1: grid layout. Step 2: blocking cube check with distances. Step 3: pick order with justification. Reach check for every placement.>",
+  "reasoning": "<Step 1: grid layout. Step 2: blocking cube check with distances. Step 3: pick order. Step 4: final simulation pass verifying each placement against remaining cubes. Reach check for every placement.>",
   "plan": [
     {"action": "pick",  "object": "<cube_name>"},
     {"action": "place", "x": <float>, "y": <float>},

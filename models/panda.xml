@@ -209,6 +209,44 @@
               rgba="0.5 0 0.8 1"/>
     </body>
 
+    <!-- Obstacle poles for OMPL health-check.
+         Placed ON the long-range transit paths (cube→tidy-slot) but
+         far enough from every cube's vertical grasp approach that IK
+         descent/lift (which ignores obstacles) clears them safely.
+         If OMPL works → arm routes around them → they stay upright.
+         If OMPL fails → IK fallback drives into them → they fall. -->
+    <body name="vase1" pos="0.100 0.150 0.900">
+      <joint type="free"/>
+      <!-- visible vase -->
+      <geom type="cylinder"
+            size="0.040 0.100"
+            mass="0.3"
+            rgba="0.7 0.3 0.8 1"
+            contype="0"
+            conaffinity="0"/>
+      <!-- invisible keep-out shell -->
+      <geom type="cylinder"
+            size="0.070 0.130"
+            rgba="0 0 0 0"
+            contype="1"
+            conaffinity="1"/>
+    </body>
+    
+    <body name="glass1" pos="0.220 -0.350 0.870">
+      <joint type="free"/>
+      <geom type="cylinder"
+            size="0.030 0.070"
+            mass="0.15"
+            rgba="0.8 0.9 1 0.35"
+            contype="0"
+            conaffinity="0"/>
+      <geom type="cylinder"
+            size="0.055 0.095"
+            rgba="0 0 0 0"
+            contype="1"
+            conaffinity="1"/>
+    </body>
+
     <body name="link0" pos="-0.4 0 0.8" childclass="panda">
       <inertial mass="0.629769" pos="-0.041018 -0.00014 0.049974"
         fullinertia="0.00315 0.00388 0.004285 8.2904e-7 0.00015 8.2299e-6"/>

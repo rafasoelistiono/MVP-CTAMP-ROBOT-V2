@@ -259,7 +259,7 @@ for replan_round in range(MAX_REPLAN):
                 plan_broke = True
                 break
 
-            place(x, y)
+            place(x, y, held_cube)
 
             ok, actual = fb.check_place(model, data, name_to_cube[held_cube], x, y)
             if ok:
