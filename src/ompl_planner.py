@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Set, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import mujoco
@@ -14,6 +14,24 @@ except ImportError as e:
         "OMPL Python bindings are not installed or not importable. "
         "Install OMPL and make sure 'from ompl import base, geometric' works."
     ) from e
+
+
+class ClearanceObjective(ob.StateCostIntegralObjective):
+    """
+    Clearance-biased objective.
+
+    Smaller cost = better.
+    We use reciprocal clearance, so paths that stay farther from obstacles
+    are cheaper.
+    """
+
+    def __init__(self, si, clearance_fn):
+        super().__init__(si, True)
+        self._clearance_fn = clearance_fn
+
+    def stateCost(self, s):
+        clr = max(float(self._clearance_fn(s)), 1e-3)
+        return ob.Cost(1.0 / clr)
 
 
 @dataclass
@@ -96,8 +114,16 @@ class PandaOMPLPlanner:
 
         # Set by plan() before each solve so the validity checker can
         # exempt the start state (the live arm configuration is always
-        # physically realised and must never be rejected by OMPL).
+        # physically realized and must never be rejected by OMPL).
         self._planning_start_q: Optional[np.ndarray] = None
+
+        # Bodies used only for clearance biasing.
+        self._robot_clearance_body_ids = [
+            self.model.body(n).id
+            for n in self.DEFAULT_ROBOT_BODIES
+            if self.model.body(n).id >= 0
+        ]
+        self._env_body_ids: Set[int] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -130,7 +156,11 @@ class PandaOMPLPlanner:
         goal_q = np.asarray(goal_q, dtype=float).reshape(-1)
 
         if start_q.shape[0] != self.ndof or goal_q.shape[0] != self.ndof:
-            raise ValueError(f"Expected {self.ndof}-D q vectors, got {start_q.shape} and {goal_q.shape}")
+            raise ValueError(
+                f"Expected {self.ndof}-D q vectors, got {start_q.shape} and {goal_q.shape}"
+            )
+
+        solve_time = float(time_limit if time_limit is not None else self.cfg.time_limit)
 
         # Update live scene snapshot used by the collision checker.
         self._sync_from_live_data()
@@ -144,71 +174,92 @@ class PandaOMPLPlanner:
 
         # Record the start configuration BEFORE setStartAndGoalStates() is
         # called so that _is_state_valid can exempt it unconditionally.
-        # The live arm state is physically realised and must never be rejected.
         self._planning_start_q = start_q.copy()
 
-        ss = og.SimpleSetup(self.space)
-        ss.setStateValidityChecker(self._is_state_valid)
-        ss.getSpaceInformation().setStateValidityCheckingResolution(self.cfg.state_validity_resolution)
-
-        start = self.space.allocState()
-        goal  = self.space.allocState()
-        for i in range(self.ndof):
-            start[i] = float(start_q[i])
-            goal[i]  = float(goal_q[i])
-
-        ss.setStartAndGoalStates(start, goal, self.cfg.goal_tolerance)
-        # Note: states allocated via allocState() are copied by SimpleSetup.
-        # Python bindings do not expose freeState on RealVectorStateSpace,
-        # so we accept the tiny per-call allocation (56 bytes) without freeing.
-
-        planner_choice = (
-            planner_name
-            if planner_name is not None
-            else (self.cfg.fragile_planner_name if fragile_mode else self.cfg.planner_name)
-        )
-
-        planner = self._make_planner(
-            ss.getSpaceInformation(),
-            planner_name=planner_choice,
-            fragile_mode=fragile_mode,
-        )
-        ss.setPlanner(planner)
-
-        solve_time = float(time_limit if time_limit is not None else self.cfg.time_limit)
-        solved = ss.solve(solve_time)
-
         planner_used = (
-           self.cfg.fragile_planner_name if fragile_mode
-           else (planner_name or self.cfg.planner_name)
+            self.cfg.fragile_planner_name if fragile_mode
+            else (planner_name or self.cfg.planner_name)
         )
 
-        info = {
-            "solved": bool(solved),
+        goal_candidates = self._goal_candidates(goal_q)
+        per_try_time = max(0.35, solve_time / max(len(goal_candidates), 1))
+
+        last_info = {
+            "solved": False,
             "planner_name": planner_used,
             "time_limit": solve_time,
             "ignored_body_names": sorted(list(self._ignored_body_names)),
             "start_q": start_q.tolist(),
             "goal_q": goal_q.tolist(),
+            "goal_attempts": [],
         }
 
-        if not solved:
-            return None, info
+        try:
+            for goal_idx, goal_try in enumerate(goal_candidates):
+                goal_state = self._q_to_state(goal_try)
 
-        if simplify:
-            try:
-                ss.simplifySolution()
-            except Exception:
-                # Simplification is optional; ignore if the binding/version differs.
-                pass
+                # Skip invalid candidate goals immediately.
+                if not self._is_state_valid(goal_state):
+                    last_info["goal_attempts"].append({
+                        "idx": goal_idx,
+                        "goal_q": goal_try.tolist(),
+                        "status": "invalid_goal",
+                    })
+                    continue
 
-        path = ss.getSolutionPath()
-        raw = self._extract_path(path)
-        dense = self._densify_path(raw, step=self.cfg.waypoint_step)
+                ss = og.SimpleSetup(self.space)
+                ss.setStateValidityChecker(self._is_state_valid)
+                ss.getSpaceInformation().setStateValidityCheckingResolution(
+                    self.cfg.state_validity_resolution
+                )
 
-        info["num_waypoints"] = int(dense.shape[0])
-        info["path_length_joint_space"] = float(self._path_length(dense))
-        return dense, info
+                objective = self._make_objective(ss.getSpaceInformation(), fragile_mode)
+                self._attach_objective(ss, objective)
+
+                start = self._q_to_state(start_q)
+                goal = self._q_to_state(goal_try)
+                ss.setStartAndGoalStates(start, goal, self.cfg.goal_tolerance)
+
+                planner = self._make_planner(
+                    ss.getSpaceInformation(),
+                    planner_name=planner_used,
+                    fragile_mode=fragile_mode,
+                )
+                ss.setPlanner(planner)
+
+                solved = ss.solve(per_try_time)
+
+                last_info["goal_attempts"].append({
+                    "idx": goal_idx,
+                    "goal_q": goal_try.tolist(),
+                    "status": "solved" if solved else "no_solution",
+                })
+
+                if not solved:
+                    continue
+
+                if simplify:
+                    try:
+                        ss.simplifySolution()
+                    except Exception:
+                        pass
+
+                path = ss.getSolutionPath()
+                raw = self._extract_path(path)
+                dense = self._densify_path(raw, step=self.cfg.waypoint_step)
+
+                last_info.update({
+                    "solved": True,
+                    "selected_goal_q": goal_try.tolist(),
+                    "num_waypoints": int(dense.shape[0]),
+                    "path_length_joint_space": float(self._path_length(dense)),
+                })
+                return dense, last_info
+
+            return None, last_info
+
+        finally:
+            self._planning_start_q = None
 
     def is_state_valid_q(self, q: Sequence[float]) -> bool:
         """Direct validity check for a 7-DoF joint vector."""
@@ -220,6 +271,23 @@ class PandaOMPLPlanner:
     # ------------------------------------------------------------------
     # OMPL helpers
     # ------------------------------------------------------------------
+
+    def _attach_objective(self, ss: og.SimpleSetup, objective) -> None:
+        """
+        Attach an optimization objective to the planning problem.
+
+        Some OMPL Python builds expose setOptimizationObjective on SimpleSetup;
+        others are safer via ProblemDefinition.
+        """
+        if hasattr(ss, "setOptimizationObjective"):
+            try:
+                ss.setOptimizationObjective(objective)
+                return
+            except Exception:
+                pass
+
+        pdef = ss.getProblemDefinition()
+        pdef.setOptimizationObjective(objective)
 
     def _make_planner(self, si: ob.SpaceInformation, planner_name: str, fragile_mode: bool = False):
         if fragile_mode:
@@ -292,6 +360,44 @@ class PandaOMPLPlanner:
         diffs = np.diff(waypoints, axis=0)
         return float(np.sum(np.linalg.norm(diffs, axis=1)))
 
+    def _clip_arm(self, q):
+        return np.clip(np.asarray(q, dtype=float).reshape(-1), self.lower, self.upper)
+
+    def _goal_candidates(self, goal_q: np.ndarray) -> list[np.ndarray]:
+        """
+        Small joint-space goal perturbations to rescue near-valid grasp goals.
+        These are tiny on purpose: they are only for invalid-goal recovery.
+        """
+        goal_q = self._clip_arm(goal_q)
+
+        offsets = [
+            np.zeros(self.ndof),
+            np.array([0.015, 0.010, 0.000, 0.000, 0.000, 0.010, 0.000]),
+            np.array([-0.015, -0.010, 0.000, 0.000, 0.000, -0.010, 0.000]),
+            np.array([0.000, 0.020, 0.000, 0.000, 0.000, -0.020, 0.000]),
+            np.array([0.000, -0.020, 0.000, 0.000, 0.000, 0.020, 0.000]),
+            np.array([0.000, 0.000, 0.000, 0.000, 0.000, 0.020, 0.000]),
+            np.array([0.000, 0.000, 0.000, 0.000, 0.000, -0.020, 0.000]),
+        ]
+        return [self._clip_arm(goal_q + off) for off in offsets]
+
+    def _make_objective(self, si: ob.SpaceInformation, fragile_mode: bool = False):
+        """
+        In non-fragile mode: plain path length.
+        In fragile mode: path length + clearance bias.
+        """
+        length_obj = ob.PathLengthOptimizationObjective(si)
+
+        if not fragile_mode:
+            return length_obj
+
+        clear_obj = ClearanceObjective(si, self._state_clearance)
+
+        opt = ob.MultiOptimizationObjective(si)
+        opt.addObjective(length_obj, 1.0)
+        opt.addObjective(clear_obj, 3.0)
+        return opt
+
     # ------------------------------------------------------------------
     # Collision checking
     # ------------------------------------------------------------------
@@ -302,9 +408,9 @@ class PandaOMPLPlanner:
         mujoco.mj_forward(self.model, self.plan_data)
 
     def _refresh_collision_sets(self) -> None:
-        # Collect geoms belonging to robot bodies.
         self.robot_geom_ids: Set[int] = set()
         self.env_geom_ids: Set[int] = set()
+        self._env_body_ids: Set[int] = set()
 
         for gid in range(self.model.ngeom):
             bid = int(self.model.geom_bodyid[gid])
@@ -316,16 +422,47 @@ class PandaOMPLPlanner:
                 self.robot_geom_ids.add(gid)
             elif body_name not in self._ignored_body_names:
                 self.env_geom_ids.add(gid)
+                self._env_body_ids.add(bid)
+
+    def _state_clearance(self, state) -> float:
+        """
+        Conservative clearance proxy:
+        minimum Euclidean distance between robot body centers and environment body centers.
+        This is a biasing signal, not a formal safety proof.
+        """
+        q = self._state_to_q(state)
+
+        self.plan_data.qpos[:] = self.live_data.qpos[:]
+        self.plan_data.qvel[:] = 0.0
+        self.plan_data.qpos[self.arm_qpos_adr] = q
+        mujoco.mj_forward(self.model, self.plan_data)
+
+        if not self._env_body_ids:
+            return 1.0
+
+        best = float("inf")
+        for rid in self._robot_clearance_body_ids:
+            rp = self.plan_data.xpos[rid]
+            for bid in self._env_body_ids:
+                d = float(np.linalg.norm(rp - self.plan_data.xpos[bid]))
+                if d < best:
+                    best = d
+
+        if not np.isfinite(best):
+            return 1.0
+        return best
 
     def _is_state_valid(self, state) -> bool:
         q = self._state_to_q(state)
 
         # The planning start state is the live arm configuration — it is
-        # physically realised and must never be rejected regardless of any
-        # contacts that IK may have left behind.  All waypoints and the goal
+        # physically realized and must never be rejected regardless of any
+        # contacts that IK may have left behind. All waypoints and the goal
         # still get the full collision check.
-        if (self._planning_start_q is not None
-                and np.allclose(q, self._planning_start_q, atol=1e-4)):
+        if (
+            self._planning_start_q is not None
+            and np.allclose(q, self._planning_start_q, atol=1e-4)
+        ):
             return True
 
         # Joint limits check
@@ -338,7 +475,7 @@ class PandaOMPLPlanner:
         self.plan_data.qpos[self.arm_qpos_adr] = q
         mujoco.mj_forward(self.model, self.plan_data)
 
-        # Collision check: any robot-environment contact → invalid.
+        # Collision check: any robot-environment contact -> invalid.
         for i in range(self.plan_data.ncon):
             con = self.plan_data.contact[i]
             g1 = int(con.geom1)
@@ -346,8 +483,8 @@ class PandaOMPLPlanner:
 
             g1_robot = g1 in self.robot_geom_ids
             g2_robot = g2 in self.robot_geom_ids
-            g1_env   = g1 in self.env_geom_ids
-            g2_env   = g2 in self.env_geom_ids
+            g1_env = g1 in self.env_geom_ids
+            g2_env = g2 in self.env_geom_ids
 
             if (g1_robot and g2_env) or (g2_robot and g1_env):
                 return False

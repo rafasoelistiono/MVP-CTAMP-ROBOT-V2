@@ -49,6 +49,11 @@ _DESIRED_Z = np.array([0.0, 0.0, -1.0])
 GRASP_OFFSET = 0.10
 APPROACH_CLEARANCE = 0.30
 
+# Elbow-up null-space reference: joint2=0.20 keeps link2 well above the table.
+# Used as a secondary IK seed when the primary converges to an elbow-down
+# configuration (joint2 > ~0.55) that would place link2 below z=0.80.
+_ELBOW_UP_REF = np.array([0.0, 0.20, 0.0, -2.40, 0.0, 2.60, -0.75])
+
 # When fragile objects are present, never use IK fallback for physical motion.
 USE_IK_FALLBACK = False
 
@@ -266,6 +271,27 @@ def _ik_solve_to(
 
     return clip_arm(q_target), info
 
+def _solve_safe_goal_candidates(target_xyz, base_null_ref, label=""):
+    planner = _get_ompl_planner()
+    candidate_refs = [
+        base_null_ref.copy(),
+        _ELBOW_UP_REF.copy(),
+    ]
+
+    # Small null-space variations help escape one bad IK basin.
+    for delta in [0.12, -0.12]:
+        ref = base_null_ref.copy()
+        ref[1] = np.clip(ref[1] + delta, arm_ranges[1, 0], arm_ranges[1, 1])
+        candidate_refs.append(ref)
+
+    for null_ref in candidate_refs:
+        goal_q, info = _ik_solve_to(target_xyz, null_ref=null_ref, steps=800)
+        if not info["converged"]:
+            continue
+        if planner is None or planner.is_state_valid_q(goal_q):
+            return goal_q, info
+
+    return None, None
 
 # =============================
 # OMPL EXECUTION
@@ -351,6 +377,27 @@ def _move_pose_safe(
             f"[exec][IK] warning for {label or 'pose'}: "
             f"pos={ik_info['pos_err_norm']:.4f} ori={ik_info['ori_err_norm']:.4f} iters={ik_info['iters']}"
         )
+
+    # If primary IK converged to an elbow-down config (joint2 > 0.55 → link2
+    # may drop below the table at z=0.80) or did not converge, try an elbow-up
+    # seed.  A large joint2 happens for close targets (x≈0.2) where the default
+    # GRASP_READY null-ref drives joint2 to ~0.65, putting link2 at z≈0.74 —
+    # below the table — so OMPL rejects every goal candidate as invalid_goal.
+    _EU_J2_THRESHOLD = 0.55
+    if goal_q[1] > _EU_J2_THRESHOLD or not ik_info["converged"]:
+        eu_ref = _ELBOW_UP_REF.copy()
+        if null_ref is not None:
+            eu_ref[0] = null_ref[0]  # match joint1 direction to target
+        goal_q_eu, ik_info_eu = _ik_solve_to(target_xyz, null_ref=eu_ref, q_seed=eu_ref)
+        if ik_info_eu["converged"] and (
+            not ik_info["converged"]
+            or ik_info_eu["pos_err_norm"] < ik_info["pos_err_norm"]
+        ):
+            goal_q, ik_info = goal_q_eu, ik_info_eu
+            print(
+                f"[exec][IK] elbow-up solution for {label or 'pose'}: "
+                f"pos={ik_info['pos_err_norm']:.4f}"
+            )
 
     ok = _move_with_ompl(
         goal_q=goal_q,
