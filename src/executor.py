@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 import mujoco
 import mujoco.viewer
 import numpy as np
 
+from config import CONFIG
+from collision_policy import CollisionPolicy
+
 try:
     from ompl_planner import make_default_panda_planner
-except Exception:
+except ImportError:
     make_default_panda_planner = None
 
 
@@ -17,19 +19,27 @@ except Exception:
 # LOAD SIMULATION (ONCE)
 # =============================
 
-_MODELS = Path(__file__).parent.parent / "models"
-model = mujoco.MjModel.from_xml_path(str(_MODELS / "panda.xml"))
+model = mujoco.MjModel.from_xml_path(str(CONFIG.model_file))
 data = mujoco.MjData(model)
 mujoco.mj_resetData(model, data)
 
-viewer = mujoco.viewer.launch_passive(model, data)
-viewer.cam.distance = 2.5
-viewer.cam.azimuth = 120
-viewer.cam.elevation = -30
-viewer.cam.lookat[:] = [0, 0, 0.7]
+class _NullViewer:
+    def sync(self) -> None:
+        pass
+
+
+if CONFIG.enable_viewer:
+    viewer = mujoco.viewer.launch_passive(model, data)
+    viewer.cam.distance = 2.5
+    viewer.cam.azimuth = 120
+    viewer.cam.elevation = -30
+    viewer.cam.lookat[:] = [0, 0, 0.7]
+else:
+    viewer = _NullViewer()
 
 # Planning-side copy. Never use the live MuJoCo state directly inside IK.
 _plan_data = mujoco.MjData(model)
+_live_collision_policy = CollisionPolicy(model)
 
 # =============================
 # ARM SETUP
@@ -55,13 +65,13 @@ APPROACH_CLEARANCE = 0.30
 _ELBOW_UP_REF = np.array([0.0, 0.20, 0.0, -2.40, 0.0, 2.60, -0.75])
 
 # When fragile objects are present, never use IK fallback for physical motion.
-USE_IK_FALLBACK = False
+USE_IK_FALLBACK = CONFIG.use_ik_fallback
 
 # Keep OMPL paths dense and the commanded motion slow.
-DEFAULT_PLANNER_NAME = "RRTConnect"
-DEFAULT_TIME_LIMIT = 3.0
-DEFAULT_SETTLE_STEPS_PER_WP = 8
-DEFAULT_FINAL_SETTLE_STEPS = 15
+DEFAULT_PLANNER_NAME = CONFIG.ompl_planner_name
+DEFAULT_TIME_LIMIT = CONFIG.ompl_time_limit
+DEFAULT_SETTLE_STEPS_PER_WP = CONFIG.settle_steps_per_waypoint
+DEFAULT_FINAL_SETTLE_STEPS = CONFIG.final_settle_steps
 
 # =============================
 # FIND CUBES
@@ -125,7 +135,7 @@ def _check_obstacles_fallen(context: str) -> None:
 # =============================
 
 _ompl_planner = None
-_OMPL_AVAILABLE = make_default_panda_planner is not None
+_OMPL_AVAILABLE = CONFIG.ompl_enabled and make_default_panda_planner is not None
 
 
 def _get_ompl_planner():
@@ -137,7 +147,12 @@ def _get_ompl_planner():
             model=model,
             data=data,
             planner_name=DEFAULT_PLANNER_NAME,
+            fragile_planner_name=CONFIG.ompl_fragile_planner_name,
             time_limit=DEFAULT_TIME_LIMIT,
+            state_validity_resolution=CONFIG.ompl_state_validity_resolution,
+            sampler_range=CONFIG.ompl_sampler_range,
+            waypoint_step=CONFIG.ompl_waypoint_step,
+            goal_tolerance=CONFIG.ompl_goal_tolerance,
         )
     else:
         _ompl_planner.sync_live_data(data)
@@ -185,6 +200,16 @@ def _step_sim(steps: int, q: Optional[np.ndarray] = None, grip: Optional[float] 
             data.ctrl[7] = float(grip)
         mujoco.mj_step(model, data)
         viewer.sync()
+
+
+def _check_live_collision(context: str, ignored_body_names: Optional[Sequence[str]] = None) -> bool:
+    _live_collision_policy.set_ignored_bodies(ignored_body_names)
+    mujoco.mj_forward(model, data)
+    report = _live_collision_policy.check_contacts(data)
+    if report.valid:
+        return True
+    print(f"[collision] blocked during {context}: {report.reason}")
+    return False
 
 
 def _finger_pos() -> float:
@@ -300,18 +325,24 @@ def _solve_safe_goal_candidates(target_xyz, base_null_ref, label=""):
 def _execute_joint_trajectory(
     traj: np.ndarray,
     grip: float,
+    ignored_body_names: Optional[Sequence[str]] = None,
     settle_steps_per_wp: int = DEFAULT_SETTLE_STEPS_PER_WP,
     final_settle_steps: int = DEFAULT_FINAL_SETTLE_STEPS,
-) -> None:
+) -> bool:
     if traj is None or len(traj) == 0:
-        return
+        return True
 
-    for q in traj:
+    for waypoint_index, q in enumerate(traj):
         q = clip_arm(np.asarray(q, dtype=float))
         for _ in range(settle_steps_per_wp):
             _set_arm_ctrl(q, grip)
             mujoco.mj_step(model, data)
             viewer.sync()
+            if not _check_live_collision(
+                context=f"trajectory waypoint {waypoint_index}",
+                ignored_body_names=ignored_body_names,
+            ):
+                return False
 
     if final_settle_steps > 0:
         final_q = clip_arm(np.asarray(traj[-1], dtype=float))
@@ -319,6 +350,13 @@ def _execute_joint_trajectory(
             _set_arm_ctrl(final_q, grip)
             mujoco.mj_step(model, data)
             viewer.sync()
+            if not _check_live_collision(
+                context="trajectory final settle",
+                ignored_body_names=ignored_body_names,
+            ):
+                return False
+
+    return True
 
 
 def _move_with_ompl(
@@ -357,8 +395,11 @@ def _move_with_ompl(
             f"[exec][OMPL] solved={info.get('solved')} "
             f"planner={info.get('planner_name')} waypoints={info.get('num_waypoints')}"
         )
-        _execute_joint_trajectory(traj, grip=grip)
-        return True
+        return _execute_joint_trajectory(
+            traj,
+            grip=grip,
+            ignored_body_names=ignored_body_names,
+        )
     except Exception as e:
         print(f"[exec][OMPL] error: {e}")
         return False

@@ -1,0 +1,10 @@
+# Core simulation and LLM dependencies.
+mujoco>=2.3.3
+numpy>=2.0,<3
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# OMPL Python bindings are required for full motion planning in src/main.py.
+# They are not available as a standard PyPI package on this Windows/Python setup.
+# Install OMPL separately, then verify with:
+# python -c "from ompl import base, geometric; print('ompl ok')"

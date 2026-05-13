@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import mujoco
+
+from collision_policy import CollisionPolicy, DEFAULT_ROBOT_BODIES
 
 try:
     from ompl import base as ob
@@ -59,11 +61,6 @@ class PandaOMPLPlanner:
           during a specific planning phase
     """
 
-    DEFAULT_ROBOT_BODIES = [
-        "link0", "link1", "link2", "link3", "link4", "link5", "link6", "link7",
-        "hand", "left_finger", "right_finger",
-    ]
-
     DEFAULT_ARM_JOINTS = [f"joint{i}" for i in range(1, 8)]
 
     def __init__(
@@ -77,7 +74,11 @@ class PandaOMPLPlanner:
         self.live_data = data
         self.cfg = config or OMPLConfig()
 
-        self.robot_body_names: Set[str] = set(robot_body_names or self.DEFAULT_ROBOT_BODIES)
+        self.robot_body_names = set(robot_body_names or DEFAULT_ROBOT_BODIES)
+        self.collision_policy = CollisionPolicy(
+            model=self.model,
+            robot_body_names=tuple(self.robot_body_names),
+        )
         self.arm_joint_names: List[str] = list(self.DEFAULT_ARM_JOINTS)
 
         self.arm_qpos_adr = np.array(
@@ -109,21 +110,15 @@ class PandaOMPLPlanner:
         self.ssi.setStateValidityCheckingResolution(self.cfg.state_validity_resolution)
         self.ssi.setStateValidityChecker(self._is_state_valid)
 
-        self._ignored_body_names: Set[str] = set()
-        self._refresh_collision_sets()
+        self._ignored_body_names: set[str] = set()
+        self.collision_policy.set_ignored_bodies(self._ignored_body_names)
 
         # Set by plan() before each solve so the validity checker can
         # exempt the start state (the live arm configuration is always
         # physically realized and must never be rejected by OMPL).
         self._planning_start_q: Optional[np.ndarray] = None
 
-        # Bodies used only for clearance biasing.
-        self._robot_clearance_body_ids = [
-            self.model.body(n).id
-            for n in self.DEFAULT_ROBOT_BODIES
-            if self.model.body(n).id >= 0
-        ]
-        self._env_body_ids: Set[int] = set()
+        self._last_invalid_reason: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -170,7 +165,7 @@ class PandaOMPLPlanner:
         else:
             self._ignored_body_names = set()
 
-        self._refresh_collision_sets()
+        self.collision_policy.set_ignored_bodies(self._ignored_body_names)
 
         # Record the start configuration BEFORE setStartAndGoalStates() is
         # called so that _is_state_valid can exempt it unconditionally.
@@ -204,6 +199,7 @@ class PandaOMPLPlanner:
                         "idx": goal_idx,
                         "goal_q": goal_try.tolist(),
                         "status": "invalid_goal",
+                        "reason": self._last_invalid_reason,
                     })
                     continue
 
@@ -407,23 +403,6 @@ class PandaOMPLPlanner:
         self.plan_data.qvel[:] = self.live_data.qvel[:]
         mujoco.mj_forward(self.model, self.plan_data)
 
-    def _refresh_collision_sets(self) -> None:
-        self.robot_geom_ids: Set[int] = set()
-        self.env_geom_ids: Set[int] = set()
-        self._env_body_ids: Set[int] = set()
-
-        for gid in range(self.model.ngeom):
-            bid = int(self.model.geom_bodyid[gid])
-            body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
-            if body_name is None:
-                continue
-
-            if body_name in self.robot_body_names:
-                self.robot_geom_ids.add(gid)
-            elif body_name not in self._ignored_body_names:
-                self.env_geom_ids.add(gid)
-                self._env_body_ids.add(bid)
-
     def _state_clearance(self, state) -> float:
         """
         Conservative clearance proxy:
@@ -437,23 +416,11 @@ class PandaOMPLPlanner:
         self.plan_data.qpos[self.arm_qpos_adr] = q
         mujoco.mj_forward(self.model, self.plan_data)
 
-        if not self._env_body_ids:
-            return 1.0
-
-        best = float("inf")
-        for rid in self._robot_clearance_body_ids:
-            rp = self.plan_data.xpos[rid]
-            for bid in self._env_body_ids:
-                d = float(np.linalg.norm(rp - self.plan_data.xpos[bid]))
-                if d < best:
-                    best = d
-
-        if not np.isfinite(best):
-            return 1.0
-        return best
+        return self.collision_policy.minimum_body_center_clearance(self.plan_data)
 
     def _is_state_valid(self, state) -> bool:
         q = self._state_to_q(state)
+        self._last_invalid_reason = None
 
         # The planning start state is the live arm configuration — it is
         # physically realized and must never be rejected regardless of any
@@ -467,6 +434,7 @@ class PandaOMPLPlanner:
 
         # Joint limits check
         if np.any(q < (self.lower - 1e-9)) or np.any(q > (self.upper + 1e-9)):
+            self._last_invalid_reason = "joint_limit"
             return False
 
         # Write candidate joint state into the planning copy of the sim.
@@ -475,19 +443,10 @@ class PandaOMPLPlanner:
         self.plan_data.qpos[self.arm_qpos_adr] = q
         mujoco.mj_forward(self.model, self.plan_data)
 
-        # Collision check: any robot-environment contact -> invalid.
-        for i in range(self.plan_data.ncon):
-            con = self.plan_data.contact[i]
-            g1 = int(con.geom1)
-            g2 = int(con.geom2)
-
-            g1_robot = g1 in self.robot_geom_ids
-            g2_robot = g2 in self.robot_geom_ids
-            g1_env = g1 in self.env_geom_ids
-            g2_env = g2 in self.env_geom_ids
-
-            if (g1_robot and g2_env) or (g2_robot and g1_env):
-                return False
+        report = self.collision_policy.check_contacts(self.plan_data)
+        if not report.valid:
+            self._last_invalid_reason = report.reason
+            return False
 
         return True
 
@@ -496,10 +455,23 @@ def make_default_panda_planner(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     planner_name: str = "BITstar",
+    fragile_planner_name: str = "BITstar",
     time_limit: float = 2.0,
+    state_validity_resolution: float = 0.005,
+    sampler_range: float = 0.08,
+    waypoint_step: float = 0.015,
+    goal_tolerance: float = 1e-3,
 ) -> PandaOMPLPlanner:
     return PandaOMPLPlanner(
         model=model,
         data=data,
-        config=OMPLConfig(planner_name=planner_name, time_limit=time_limit),
+        config=OMPLConfig(
+            planner_name=planner_name,
+            fragile_planner_name=fragile_planner_name,
+            time_limit=time_limit,
+            state_validity_resolution=state_validity_resolution,
+            sampler_range=sampler_range,
+            waypoint_step=waypoint_step,
+            goal_tolerance=goal_tolerance,
+        ),
     )
