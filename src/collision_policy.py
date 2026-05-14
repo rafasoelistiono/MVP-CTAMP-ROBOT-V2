@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Iterable, Optional, Sequence, Set
 
 import mujoco
@@ -42,18 +43,30 @@ class CollisionPolicy:
     MuJoCo contact policy for OMPL state validity.
 
     The planner treats named robot bodies as the robot and every other non-ignored
-    body as environment. A state is invalid when MuJoCo reports any contact between
-    a robot geom and an environment geom.
+    body as environment. Contacts with movable non-obstacle objects are blocked
+    unless that body is explicitly ignored for the current pick/place phase.
+    Obstacle/vase/glass/ceramic contact uses a very small penetration tolerance:
+    light near-contact is ignored, but meaningful penetration remains invalid.
     """
 
     def __init__(
         self,
         model: mujoco.MjModel,
         robot_body_names: Optional[Sequence[str]] = None,
+        obstacle_penetration_tolerance: Optional[float] = None,
     ) -> None:
         self.model = model
         self.robot_body_names: Set[str] = set(robot_body_names or DEFAULT_ROBOT_BODIES)
         self.ignored_body_names: Set[str] = set()
+        self.obstacle_penetration_tolerance = (
+            float(os.getenv("OBSTACLE_CONTACT_TOLERANCE", "0.003"))
+            if obstacle_penetration_tolerance is None
+            else float(obstacle_penetration_tolerance)
+        )
+        self.allow_movable_object_contact = (
+            os.getenv("ALLOW_MOVABLE_OBJECT_CONTACT", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self.robot_geom_ids: Set[int] = set()
         self.env_geom_ids: Set[int] = set()
         self.env_body_ids: Set[int] = set()
@@ -103,6 +116,24 @@ class CollisionPolicy:
             if (geom1_robot and geom2_env) or (geom2_robot and geom1_env):
                 body1 = self._body_name_for_geom(geom1)
                 body2 = self._body_name_for_geom(geom2)
+                env_body = body2 if geom1_robot else body1
+
+                if env_body in self.ignored_body_names:
+                    continue
+
+                # Only explicitly ignored movable bodies, usually the current
+                # pick target or held object, may be touched. Other cubes and
+                # circles are treated as obstacles so transit paths do not bump
+                # through unrelated objects.
+                if env_body is not None and self._is_movable_object(env_body):
+                    if self.allow_movable_object_contact:
+                        continue
+
+                if env_body is not None and self._is_obstacle(env_body):
+                    penetration = max(0.0, -float(contact.dist))
+                    if penetration <= self.obstacle_penetration_tolerance:
+                        continue
+
                 return CollisionReport(
                     valid=False,
                     geom1=geom1,
@@ -139,3 +170,11 @@ class CollisionPolicy:
             return True
         except KeyError:
             return False
+
+    def _is_movable_object(self, body_name: str) -> bool:
+        lower = body_name.lower()
+        return lower.startswith(("cube", "circle")) and not self._is_obstacle(lower)
+
+    def _is_obstacle(self, body_name: str) -> bool:
+        lower = body_name.lower()
+        return any(token in lower for token in ("obstacle", "vase", "glass", "ceramic"))

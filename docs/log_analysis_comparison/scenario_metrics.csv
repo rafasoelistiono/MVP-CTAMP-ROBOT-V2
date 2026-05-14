@@ -1,0 +1,4 @@
+scenario,scenario_label,runs,objects_moved,objects_total,failed_count,success_rate_objects,ompl_start,ompl_ok,ompl_failed,trajectory_start,trajectory_ok,trajectory_failed,pick_failed,place_ok_events,collision_blocked,precheck_skips
+before,Sebelum improvements,2,4,12,8,0.3333333333333333,53,52,1,52,35,16,19,4,16,0
+after,Sesudah improvements,2,6,12,6,0.5,54,54,0,54,54,0,18,6,0,0
+two_arm,Two arm,2,3,16,13,0.1875,50,50,0,50,40,10,6,3,10,5

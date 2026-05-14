@@ -1,10 +1,20 @@
-# Core simulation and LLM dependencies.
+# Core simulation/runtime dependencies
 mujoco>=2.3.3
 numpy>=2.0,<3
-openai>=1.0.0
 python-dotenv>=1.0.0
 
-# OMPL Python bindings are required for full motion planning in src/main.py.
-# They are not available as a standard PyPI package on this Windows/Python setup.
-# Install OMPL separately, then verify with:
-# python -c "from ompl import base, geometric; print('ompl ok')"
+# LLM path used by src/main.py / src/llm_planner.py
+openai>=1.0.0
+
+# Log analysis and README figures
+pandas>=2.2.0
+matplotlib>=3.8.0
+
+# OMPL Python bindings are required for the OMPL-only task scripts and planner.
+# On the WSL environment used for this project this may work:
+#   pip install ompl
+# Verify with:
+#   python -c "from ompl import base, geometric; print('ompl ok')"
+#
+# If pip ompl is unavailable for your Python/OS combo, install OMPL separately
+# from system packages/source and ensure the Python bindings are importable.

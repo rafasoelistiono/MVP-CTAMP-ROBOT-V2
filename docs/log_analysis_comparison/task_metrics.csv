@@ -1,0 +1,6 @@
+scenario,scenario_label,task,objects_moved,objects_total,failed_count,duration_ms,success_rate_objects
+after,Sesudah improvements,align_cubes,2,4,2,63210,0.5
+after,Sesudah improvements,separate_groups,4,8,4,130285,0.5
+before,Sebelum improvements,align_cubes,2,4,2,38746,0.5
+before,Sebelum improvements,separate_groups,2,8,6,92245,0.25
+two_arm,Two arm,separate_groups_two_arm,3,16,13,222776,0.1875

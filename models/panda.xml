@@ -132,7 +132,32 @@
               friction="1 0.5 0.5"/>
     </body>
 
-    <body name="cube1" pos="0.2 0 0.78">
+    <!-- Visual goal area: separated rows for square and circle objects. -->
+    <body name="goal_area" pos="0.22 -0.06 0.806">
+      <geom name="goal_area_base"
+            type="box"
+            size="0.26 0.20 0.003"
+            rgba="0.05 0.35 0.95 0.22"
+            contype="0"
+            conaffinity="0"/>
+      <geom name="goal_square_row"
+            type="box"
+            size="0.24 0.025 0.004"
+            pos="0 -0.065 0.004"
+            rgba="0.95 0.25 0.15 0.35"
+            contype="0"
+            conaffinity="0"/>
+      <geom name="goal_circle_row"
+            type="box"
+            size="0.24 0.025 0.004"
+            pos="0 0.065 0.004"
+            rgba="0.1 0.8 0.45 0.35"
+            contype="0"
+            conaffinity="0"/>
+    </body>
+
+    <!-- Balanced movable objects: 4 squares and 4 circles, initially mixed. -->
+    <body name="cube1" pos="0.02 -0.50 0.83">
         <joint type="free"/>
         <geom type="box"
               size="0.03 0.03 0.03"
@@ -143,7 +168,7 @@
               rgba="1 0 0 1"/>
     </body>
 
-    <body name="cube2" pos="0.1 0.3 0.78">
+    <body name="cube2" pos="0.18 -0.50 0.83">
         <joint type="free"/>
         <geom type="box"
               size="0.03 0.03 0.03"
@@ -154,7 +179,7 @@
               rgba="0 1 0 1"/>
     </body>
 
-    <body name="cube3" pos="0.0 -0.4 0.78">
+    <body name="cube3" pos="0.30 -0.36 0.83">
         <joint type="free"/>
         <geom type="box"
               size="0.03 0.03 0.03"
@@ -165,7 +190,7 @@
               rgba="0 0 1 1"/>
     </body>
 
-    <body name="cube4" pos="0.15 -0.25 0.78">
+    <body name="cube4" pos="0.34 -0.20 0.83">
         <joint type="free"/>
         <geom type="box"
               size="0.03 0.03 0.03"
@@ -176,67 +201,48 @@
               rgba="1 1 0 1"/>
     </body>
 
-    <body name="cube5" pos="0.15 -0.5 0.78">
+    <body name="circle1" pos="0.02 0.20 0.84">
         <joint type="free"/>
-        <geom type="box"
-              size="0.03 0.03 0.03"
-              mass="0.1"
-              friction="2 1 0.5"
+        <geom type="cylinder"
+              size="0.026 0.04"
+              mass="0.08"
+              friction="3 1.5 0.8"
               contype="1"
               conaffinity="1"
-              rgba="1 1 1 1"/>
+              rgba="0.0 0.9 0.9 1"/>
     </body>
 
-    <body name="cube6" pos="0.3 -0.1 0.78">
+    <body name="circle2" pos="0.16 0.36 0.84">
         <joint type="free"/>
-        <geom type="box"
-              size="0.03 0.03 0.03"
-              mass="0.1"
-              friction="2 1 0.5"
+        <geom type="cylinder"
+              size="0.026 0.04"
+              mass="0.08"
+              friction="3 1.5 0.8"
               contype="1"
               conaffinity="1"
-              rgba="1 0.5 0 1"/>
+              rgba="0.1 0.7 1.0 1"/>
     </body>
 
-    <body name="cube7" pos="-0.05 0.2 0.78">
+    <body name="circle3" pos="0.30 0.24 0.84">
         <joint type="free"/>
-        <geom type="box"
-              size="0.03 0.03 0.03"
-              mass="0.1"
-              friction="2 1 0.5"
+        <geom type="cylinder"
+              size="0.026 0.04"
+              mass="0.08"
+              friction="3 1.5 0.8"
               contype="1"
               conaffinity="1"
-              rgba="0.5 0 0.8 1"/>
+              rgba="0.2 1.0 0.45 1"/>
     </body>
 
-    <body name="vase1" pos="0.100 0.150 0.900">
-      <joint type="free"/>
-      <geom type="cylinder"
-            size="0.040 0.100"
-            mass="0.3"
-            rgba="0.7 0.3 0.8 1"
-            contype="0"
-            conaffinity="0"/>
-      <geom type="cylinder"
-            size="0.110 0.160"
-            rgba="0 0 0 0"
-            contype="1"
-            conaffinity="1"/>
-    </body>
-    
-    <body name="glass1" pos="0.220 -0.350 0.870">
-      <joint type="free"/>
-      <geom type="cylinder"
-            size="0.030 0.070"
-            mass="0.15"
-            rgba="0.8 0.9 1 0.35"
-            contype="0"
-            conaffinity="0"/>
-      <geom type="cylinder"
-            size="0.090 0.130"
-            rgba="0 0 0 0"
-            contype="1"
-            conaffinity="1"/>
+    <body name="circle4" pos="0.24 0.50 0.84">
+        <joint type="free"/>
+        <geom type="cylinder"
+              size="0.026 0.04"
+              mass="0.08"
+              friction="3 1.5 0.8"
+              contype="1"
+              conaffinity="1"
+              rgba="0.3 0.9 0.2 1"/>
     </body>
 
     <body name="link0" pos="-0.4 0 0.8" childclass="panda">

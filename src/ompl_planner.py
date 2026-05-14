@@ -69,6 +69,7 @@ class PandaOMPLPlanner:
         data: mujoco.MjData,
         config: Optional[OMPLConfig] = None,
         robot_body_names: Optional[Sequence[str]] = None,
+        arm_joint_names: Optional[Sequence[str]] = None,
     ):
         self.model = model
         self.live_data = data
@@ -79,7 +80,7 @@ class PandaOMPLPlanner:
             model=self.model,
             robot_body_names=tuple(self.robot_body_names),
         )
-        self.arm_joint_names: List[str] = list(self.DEFAULT_ARM_JOINTS)
+        self.arm_joint_names: List[str] = list(arm_joint_names or self.DEFAULT_ARM_JOINTS)
 
         self.arm_qpos_adr = np.array(
             [self.model.joint(n).qposadr[0] for n in self.arm_joint_names],
@@ -461,10 +462,14 @@ def make_default_panda_planner(
     sampler_range: float = 0.08,
     waypoint_step: float = 0.015,
     goal_tolerance: float = 1e-3,
+    robot_body_names: Optional[Sequence[str]] = None,
+    arm_joint_names: Optional[Sequence[str]] = None,
 ) -> PandaOMPLPlanner:
     return PandaOMPLPlanner(
         model=model,
         data=data,
+        robot_body_names=robot_body_names,
+        arm_joint_names=arm_joint_names,
         config=OMPLConfig(
             planner_name=planner_name,
             fragile_planner_name=fragile_planner_name,
