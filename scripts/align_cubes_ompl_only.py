@@ -19,6 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from ctamp_task_utils import (
     apply_conservative_motion_defaults,
+    apply_scene_motion_defaults,
     make_event_log_path,
     normalize_scene_key,
     obstacle_mode_for_scene,
@@ -30,6 +31,8 @@ REACH_BORDERLINE_M = 0.78
 REACH_HARD_M = 0.82
 OBSTACLE_TOO_CLOSE_M = 0.12
 OBSTACLE_NEAR_M = 0.18
+MAX_PICK_RETRY_SOURCE_SHIFT_M = 0.18
+TARGET_CERAMIC_BUFFER_M = 0.13
 
 
 def _min_ceramic_distance_xy(obj, world_state) -> float:
@@ -73,10 +76,14 @@ def _terminal_pick_failure_reason(executor, object_id: str, world_state) -> str 
     pos = _runtime_object_pose(executor, object_id)
     table_top = float(world_state["table"]["z_top"])
     reach_distance = math.dist(pos[:2], world_state["robot"]["base_xy"])
+    source = next((obj for obj in world_state["movable_objects"] if obj["id"] == object_id), None)
+    source_shift = math.dist(pos[:2], source["position"][:2]) if source else 0.0
     if pos[2] < table_top - 0.08:
         return "object_displaced_below_table"
     if reach_distance > world_state["robot"]["reach_max_m"] + 0.10:
         return "object_outside_robot_reach_after_displacement"
+    if source_shift > MAX_PICK_RETRY_SOURCE_SHIFT_M:
+        return "object_displaced_after_failed_pick"
     return None
 
 
@@ -188,7 +195,7 @@ def _parse_scene(scene_file: str):
         "counts": {"movable": len(movable_objects), "ceramic": len(ceramic_obstacles)},
         "safety": {
             "inflated_ceramic_regions": [
-                {"id": o["id"], "center_xy": o["position"][:2], "radius": o["radius"] + 0.08}
+                {"id": o["id"], "center_xy": o["position"][:2], "radius": o["radius"] + TARGET_CERAMIC_BUFFER_M}
                 for o in ceramic_obstacles
             ]
         },
@@ -289,15 +296,11 @@ def _build_aligned_cube_targets(scene_file: str, spacing: float = 0.11):
     for cube in cubes:
         obstacle_status = _obstacle_status(cube, world_state)
         reach_status = _reach_status(cube, world_state)
-        if obstacle_status != "CLEAR":
+        if obstacle_status == "TOO_CLOSE":
             skipped.append({
                 "object_id": cube["id"],
                 "stage": "precheck",
-                "failure_reason": (
-                    "object_too_close_to_obstacle"
-                    if obstacle_status == "TOO_CLOSE"
-                    else "object_near_obstacle_safety_skip"
-                ),
+                "failure_reason": "object_too_close_to_obstacle",
                 "obstacle_distance": round(_min_ceramic_distance_xy(cube, world_state), 4),
                 "obstacle_status": obstacle_status,
             })
@@ -361,6 +364,7 @@ def main() -> int:
     os.environ["CTAMP_OBSTACLE_MODE"] = obstacle_mode_for_scene(scene_key)
     os.environ.setdefault("OMPL_ENABLED", "true")
     os.environ.setdefault("USE_IK_FALLBACK", "false")
+    apply_scene_motion_defaults(scene_key)
     apply_conservative_motion_defaults()
     os.environ["ENABLE_VIEWER"] = "false" if args.no_viewer else "true"
 
@@ -464,12 +468,10 @@ def main() -> int:
             obstacle_distance = _min_ceramic_distance_xy(obj, world_state)
             obstacle_status = _obstacle_status(obj, world_state)
             reach_status = _reach_status(obj, world_state)
-            if obstacle_status != "CLEAR" or reach_status == "HARD":
+            if obstacle_status == "TOO_CLOSE" or reach_status == "HARD":
                 reason = (
                     "object_too_close_to_obstacle"
                     if obstacle_status == "TOO_CLOSE"
-                    else "object_near_obstacle_safety_skip"
-                    if obstacle_status == "NEAR"
                     else "object_outside_conservative_reach"
                 )
                 print(
@@ -493,11 +495,44 @@ def main() -> int:
                     "obstacle_distance": round(obstacle_distance, 4),
                 })
                 continue
+            if obstacle_status == "NEAR":
+                print(
+                    f"\n[{index:02d}] CAUTIOUS_OBJECT object={object_id} "
+                    f"obstacle_distance={obstacle_distance:.3f}m; execute_with_high_clearance"
+                )
+                log_event(
+                    "OBSTACLE_PROXIMITY",
+                    "NEAR_CAUTIOUS",
+                    object_id=object_id,
+                    phase="precheck",
+                    obstacle_distance=round(obstacle_distance, 4),
+                    threshold=OBSTACLE_NEAR_M,
+                )
             pick_attempts[object_id] += 1
             print(f"\n[{index:02d}] ALIGN_CUBE START object={object_id} target=({x:.3f}, {y:.3f})")
             print(f"[{index:02d}] PICK_ATTEMPT {pick_attempts[object_id]}/{max_pick_attempts}")
 
-            executor.pick(object_id)
+            try:
+                executor.pick(object_id)
+            except RuntimeError as exc:
+                reason = "obstacle_displaced" if "obstacle displacement" in str(exc) else "executor_runtime_error"
+                print(f"[{index:02d}] PICK_EXCEPTION object={object_id} reason={reason}: {exc}")
+                log_event(
+                    "TASK_EXCEPTION",
+                    "FAILED",
+                    object_id=object_id,
+                    phase="pick",
+                    failure_reason=reason,
+                    error=str(exc),
+                )
+                failed.append({
+                    "object_id": object_id,
+                    "stage": "pick",
+                    "failure_reason": reason,
+                    "error": str(exc),
+                    "attempts": pick_attempts[object_id],
+                })
+                continue
             pick_ok, pick_z = feedback.check_pick(executor.model, executor.data, executor.name_to_cube[object_id])
             print(f"[{index:02d}] CHECK_PICK   {'OK' if pick_ok else 'FAIL'} attempt={pick_attempts[object_id]} z={pick_z}")
             log_event(
@@ -511,8 +546,9 @@ def main() -> int:
             )
             if not pick_ok:
                 terminal_reason = _terminal_pick_failure_reason(executor, object_id, world_state)
-                executor.drop()
+                executor.drop(object_id)
                 _settle(executor, args.settle_after_place)
+                terminal_reason = terminal_reason or _terminal_pick_failure_reason(executor, object_id, world_state)
                 if terminal_reason is None and pick_attempts[object_id] < max_pick_attempts:
                     print(
                         f"[{index:02d}] DEFER_OBJECT object={object_id} reason=pick_failed "
@@ -545,7 +581,27 @@ def main() -> int:
             for retry in range(args.place_retries + 1):
                 if retry > 0:
                     print(f"[{index:02d}] PLACE_RETRY  retry={retry}")
-                executor.place(x, y, object_id)
+                try:
+                    executor.place(x, y, object_id)
+                except RuntimeError as exc:
+                    reason = "obstacle_displaced" if "obstacle displacement" in str(exc) else "executor_runtime_error"
+                    print(f"[{index:02d}] PLACE_EXCEPTION object={object_id} reason={reason}: {exc}")
+                    log_event(
+                        "TASK_EXCEPTION",
+                        "FAILED",
+                        object_id=object_id,
+                        phase="place",
+                        failure_reason=reason,
+                        error=str(exc),
+                    )
+                    failed.append({
+                        "object_id": object_id,
+                        "stage": "place",
+                        "failure_reason": reason,
+                        "error": str(exc),
+                    })
+                    place_ok = False
+                    break
                 _settle(executor, args.settle_after_place)
                 place_ok, actual = feedback.check_place(executor.model, executor.data, executor.name_to_cube[object_id], x, y)
                 print(f"[{index:02d}] CHECK_PLACE  {'OK' if place_ok else 'FAIL'} retry={retry} actual={actual}")
@@ -563,19 +619,38 @@ def main() -> int:
                 )
                 if place_ok:
                     break
-                executor.drop()
+                executor.drop(object_id)
                 _settle(executor, args.settle_after_place)
+                break
 
             if place_ok:
                 moved.append(object_id)
                 _settle(executor, args.settle_after_place)
             else:
-                failed.append({
-                    "object_id": object_id,
-                    "stage": "place",
-                    "failure_reason": "object_not_on_target_after_place",
-                    "actual": actual,
-                })
+                already_failed = any(item.get("object_id") == object_id and item.get("stage") == "place" for item in failed)
+                terminal_reason = _terminal_pick_failure_reason(executor, object_id, world_state)
+                if not already_failed and terminal_reason is None and pick_attempts[object_id] < max_pick_attempts:
+                    print(
+                        f"[{index:02d}] DEFER_OBJECT object={object_id} reason=place_failed_repick "
+                        f"attempts={pick_attempts[object_id]}/{max_pick_attempts}; try_next_candidate"
+                    )
+                    log_event(
+                        "DEFER_OBJECT",
+                        "RETRY_LATER",
+                        object_id=object_id,
+                        phase="place",
+                        failure_reason="place_failed_repick_required",
+                        attempt=pick_attempts[object_id],
+                        max_attempts=max_pick_attempts,
+                    )
+                    pending.append(object_id)
+                elif not already_failed:
+                    failed.append({
+                        "object_id": object_id,
+                        "stage": "place",
+                        "failure_reason": terminal_reason or "object_not_on_target_after_place",
+                        "actual": actual,
+                    })
 
     duration_ms = int((time.perf_counter() - started) * 1000)
     success = len(failed) == 0

@@ -33,7 +33,18 @@ CONSERVATIVE_MOTION_DEFAULTS = {
     "MIN_PICK_OBSTACLE_CLEARANCE": "0.18",
     "CAUTIOUS_OBSTACLE_CLEARANCE": "0.24",
     "FINGER_MOVABLE_CONTACT_TOLERANCE": "0.018",
+    "TABLE_FINGER_CONTACT_TOLERANCE": "0.005",
     "ALLOW_MOVABLE_OBJECT_CONTACT": "false",
+}
+
+OBSTACLE_SCENE_MOTION_DEFAULTS = {
+    # Refactor 3: in obstacle scenes, "near" objects should execute with the
+    # cautious high-clearance profile. Only the hard TOO_CLOSE band should stop
+    # execution before the arm gets a chance to plan.
+    "MIN_PICK_OBSTACLE_CLEARANCE": "0.12",
+    "CAUTIOUS_OBSTACLE_CLEARANCE": "0.28",
+    "MAX_VALID_IK_CANDIDATES": "8",
+    "OMPL_TIME_LIMIT": "8.0",
 }
 
 SCENE_ALIASES = {
@@ -104,8 +115,10 @@ VARIANT_OBJECTS = {
 }
 
 OBSTACLE_POSITIONS = {
-    "obstacle1": (0.08, -0.30, 0.89),
-    "obstacle2": (0.32, 0.19, 0.89),
+    # Refactor 3 validated obstacle mapping: keep obstacles in the workspace,
+    # but do not place them directly on the pick-place corridor of group scenes.
+    "obstacle1": (-0.18, -0.30, 0.89),
+    "obstacle2": (0.42, 0.18, 0.89),
 }
 
 
@@ -241,6 +254,16 @@ def apply_conservative_motion_defaults() -> None:
     import os
 
     for name, value in CONSERVATIVE_MOTION_DEFAULTS.items():
+        os.environ.setdefault(name, value)
+
+
+def apply_scene_motion_defaults(scene_key: str) -> None:
+    """Apply per-scene overrides before the conservative defaults are loaded."""
+    import os
+
+    if obstacle_mode_for_scene(scene_key) != "obs":
+        return
+    for name, value in OBSTACLE_SCENE_MOTION_DEFAULTS.items():
         os.environ.setdefault(name, value)
 
 

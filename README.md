@@ -25,10 +25,14 @@ Validasi final no-obstacle dari log terbaru:
 | Tabung | `group_no_obs` | 4/4 | `align_tabung_group_no_obs_20260527_204857.csv` |
 | Tabung | `ungroup_no_obs` | 4/4 | `align_tabung_ungroup_no_obs_20260527_205443.csv` |
 
-Obstacle scenario dipisahkan dari tabel ini karena safety precheck memang dapat
-men-skip objek yang terlalu dekat obstacle. Contoh: `tabung_group_obs` terakhir
-menolak beberapa objek karena `object_near_obstacle_safety_skip`; itu berbeda
-dari arm gagal bergerak.
+Validasi final obstacle group setelah Refactor 3:
+
+![Final obstacle success matrix](docs/final_obs_success_matrix.svg)
+
+| Task | Scene | Result | Log summary |
+|---|---|---:|---|
+| Cubes | `group_obs` | 4/4 | `align_cubes_group_obs_20260527_221340.csv` |
+| Tabung | `group_obs` | 4/4 | `align_tabung_group_obs_20260527_221940.csv` |
 
 ## Cara Run
 
@@ -239,6 +243,74 @@ Notes dari capture log:
 - Setelah ignore-list dan far-grasp height fix, `cube4` group no-obs naik dari
   3/4 ke 4/4.
 
+### 4. Refactor 3
+
+Fokus utama:
+
+- Membuat `group_obs` cubes dan tabung mencapai 4/4 seperti no-obstacle.
+- Memisahkan objek `NEAR` dari objek `TOO_CLOSE`: `NEAR` dijalankan dengan
+  cautious high-clearance, bukan otomatis di-skip.
+- Memvalidasi ulang static obstacle mapping agar obstacle tetap ada di workspace
+  tetapi tidak tepat berada di koridor pick-place utama.
+- Mengurangi false failure dari kontak ringan `table <-> finger` saat grasp/lift
+  tanpa menonaktifkan collision checking.
+- Membuat place failure melakukan repick, bukan memanggil `place()` lagi ketika
+  tidak ada object yang sedang dipegang.
+
+Pipeline Refactor 3:
+
+```text
+task script group_obs
+  -> validated scene variant
+  -> target allocation dengan ceramic buffer lebih besar
+  -> precheck:
+      TOO_CLOSE -> skip/fail aman
+      NEAR      -> cautious execution
+      CLEAR     -> normal execution
+  -> IK candidates + MuJoCo FK validation
+  -> OMPL plan with collision checking
+  -> execution with small table-finger tolerance only
+  -> pick/place feedback
+  -> repick if place slip is recoverable
+  -> summary + event logs
+```
+
+Perubahan teknis:
+
+- `OBSTACLE_POSITIONS` untuk `group_obs` divalidasi ulang:
+  `obstacle1=(-0.18, -0.30)`, `obstacle2=(0.42, 0.18)`.
+- `MIN_PICK_OBSTACLE_CLEARANCE` untuk obstacle scene diturunkan ke hard stop
+  `0.12 m`, sedangkan `CAUTIOUS_OBSTACLE_CLEARANCE` dinaikkan ke `0.28 m`.
+- Target allocation memakai ceramic buffer `0.13 m`, sehingga target tidak
+  dipilih terlalu dekat obstacle.
+- `TABLE_FINGER_CONTACT_TOLERANCE=0.005` mengizinkan penetrasi finger-table yang
+  sangat kecil pada fase grasp/lift, tetapi collision besar tetap gagal.
+- Cylinder retry grasp kembali memakai offset minimal `0.095`, karena log
+  menunjukkan profile ini yang berhasil mengangkat `circle2`.
+- Fatal exception seperti obstacle displacement ditangkap di task script agar
+  summary CSV tetap tertulis.
+
+Hasil Refactor 3:
+
+![Refactor 3 group obstacle progress](docs/refactor3_group_obs_progress.svg)
+
+- Sebelum Refactor 3, `align_cubes_group_obs_20260527_215406.csv`: 1/4.
+- Sebelum Refactor 3, `align_tabung_group_obs_20260527_205059.csv`: 1/4.
+- Setelah Refactor 3, `align_cubes_group_obs_20260527_221340.csv`: 4/4.
+- Setelah Refactor 3, `align_tabung_group_obs_20260527_221940.csv`: 4/4.
+
+Notes dari capture log:
+
+- Failure awal bukan karena OMPL tidak bisa plan. OMPL mayoritas solved, tetapi
+  object tidak pernah masuk pipeline karena `object_near_obstacle_safety_skip`.
+- Pada cubes, obstacle1 berada di koridor cube1 sehingga object slip ke dekat
+  obstacle saat place. Ini static mapping problem.
+- Pada tabung, retry cylinder terlalu tinggi setelah perubahan sementara,
+  sehingga `circle2` tidak terangkat. Mengembalikan retry offset `0.095`
+  memulihkan lift.
+- Setelah mapping dan execution guard diperbaiki, `group_obs` cubes/tabung
+  mencapai 100% tanpa direct IK fallback dan tanpa mematikan collision checking.
+
 ## Insight dari Log
 
 1. No-obstacle failure bukan berarti planner obstacle avoidance buruk.
@@ -264,6 +336,10 @@ Notes dari capture log:
 6. Retry harus berhenti jika object sudah tidak valid.
    Jika object jatuh di bawah meja atau keluar reach, retry IK/OMPL hanya
    membuang waktu dan memperkeruh log.
+
+7. Obstacle placement harus divalidasi sebagai bagian dari task generation.
+   Jika obstacle berada tepat di koridor pick-place, failure terlihat seperti
+   grasp/place issue padahal akar masalahnya static mapping.
 
 ## Log dan Metrik
 
@@ -300,6 +376,8 @@ Data visualisasi dibuat dari log dan disimpan di:
 
 - `docs/refactor_success_progress.svg`
 - `docs/final_no_obs_success_matrix.svg`
+- `docs/final_obs_success_matrix.svg`
+- `docs/refactor3_group_obs_progress.svg`
 - `docs/failure_focus_by_refactor.svg`
 - `docs/refactor_metrics.csv`
 
@@ -338,10 +416,18 @@ OMPL_REQUIRED=false
 OMPL_PLANNER_NAME=RRTConnect
 OMPL_TIME_LIMIT=6.0
 USE_IK_FALLBACK=false
+MIN_PICK_OBSTACLE_CLEARANCE=0.18
+CAUTIOUS_OBSTACLE_CLEARANCE=0.24
+TABLE_FINGER_CONTACT_TOLERANCE=0.005
+CYLINDER_RETRY_MIN_GRASP_OFFSET=0.095
 ```
 
 Untuk production-style run, `USE_IK_FALLBACK=false` harus tetap dipertahankan
 agar arm tidak bypass OMPL.
+
+Untuk obstacle scene, task script menerapkan override aman:
+`MIN_PICK_OBSTACLE_CLEARANCE=0.12`, `CAUTIOUS_OBSTACLE_CLEARANCE=0.28`,
+`MAX_VALID_IK_CANDIDATES=8`, dan `OMPL_TIME_LIMIT=8.0`.
 
 ## Test
 

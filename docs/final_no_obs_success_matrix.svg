@@ -1,26 +1,36 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="980" height="330" viewBox="0 0 980 330">
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="330" viewBox="0 0 820 330">
 <rect width="100%" height="100%" fill="#ffffff"/>
-<text x="36" y="42" font-size="24" font-weight="700" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Validasi Final No-Obstacle</text>
-<text x="36" y="68" font-size="13" font-weight="400" fill="#52616b" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Empat scenario utama group/ungroup untuk cubes dan tabung pada log terbaru.</text>
-<rect x="42" y="105" width="205" height="145" rx="8" fill="#e9f8ef" stroke="#1f9d55" stroke-width="2"/>
-<text x="60" y="137" font-size="18" font-weight="800" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">CUBES</text>
-<text x="60" y="160" font-size="13" font-weight="600" fill="#52616b" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">group no obs</text>
-<text x="60" y="201" font-size="38" font-weight="800" fill="#1f9d55" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">4/4</text>
-<text x="60" y="229" font-size="14" font-weight="700" fill="#1f9d55" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">100% success</text>
-<rect x="277" y="105" width="205" height="145" rx="8" fill="#e9f8ef" stroke="#1f9d55" stroke-width="2"/>
-<text x="295" y="137" font-size="18" font-weight="800" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">CUBES</text>
-<text x="295" y="160" font-size="13" font-weight="600" fill="#52616b" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">ungroup no obs</text>
-<text x="295" y="201" font-size="38" font-weight="800" fill="#1f9d55" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">4/4</text>
-<text x="295" y="229" font-size="14" font-weight="700" fill="#1f9d55" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">100% success</text>
-<rect x="512" y="105" width="205" height="145" rx="8" fill="#e9f8ef" stroke="#1f9d55" stroke-width="2"/>
-<text x="530" y="137" font-size="18" font-weight="800" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">TABUNG</text>
-<text x="530" y="160" font-size="13" font-weight="600" fill="#52616b" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">group no obs</text>
-<text x="530" y="201" font-size="38" font-weight="800" fill="#1f9d55" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">4/4</text>
-<text x="530" y="229" font-size="14" font-weight="700" fill="#1f9d55" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">100% success</text>
-<rect x="747" y="105" width="205" height="145" rx="8" fill="#e9f8ef" stroke="#1f9d55" stroke-width="2"/>
-<text x="765" y="137" font-size="18" font-weight="800" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">TABUNG</text>
-<text x="765" y="160" font-size="13" font-weight="600" fill="#52616b" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">ungroup no obs</text>
-<text x="765" y="201" font-size="38" font-weight="800" fill="#1f9d55" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">4/4</text>
-<text x="765" y="229" font-size="14" font-weight="700" fill="#1f9d55" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">100% success</text>
-<text x="42" y="294" font-size="12" font-weight="400" fill="#52616b" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Catatan: obstacle scenario dipisahkan karena safety precheck memang dapat men-skip objek yang terlalu dekat obstacle.</text>
+<text x="410.0" y="28" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#111827">Final No-Obstacle Success Matrix</text>
+<line x1="70" y1="235" x2="795" y2="235" stroke="#9ca3af"/>
+<line x1="70" y1="55" x2="70" y2="235" stroke="#9ca3af"/>
+<line x1="70" y1="235.0" x2="795" y2="235.0" stroke="#e5e7eb"/>
+<text x="60" y="239.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#4b5563">0%</text>
+<line x1="70" y1="190.0" x2="795" y2="190.0" stroke="#e5e7eb"/>
+<text x="60" y="194.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#4b5563">25%</text>
+<line x1="70" y1="145.0" x2="795" y2="145.0" stroke="#e5e7eb"/>
+<text x="60" y="149.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#4b5563">50%</text>
+<line x1="70" y1="100.0" x2="795" y2="100.0" stroke="#e5e7eb"/>
+<text x="60" y="104.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#4b5563">75%</text>
+<line x1="70" y1="55.0" x2="795" y2="55.0" stroke="#e5e7eb"/>
+<text x="60" y="59.0" text-anchor="end" font-family="Arial, sans-serif" font-size="11" fill="#4b5563">100%</text>
+<rect x="70.0" y="55.0" width="170.8" height="180.0" rx="4" fill="#0f766e"/>
+<text x="155.4" y="48.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="700" fill="#111827">100%</text>
+<text x="155.4" y="257.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">cubes</text>
+<text x="155.4" y="271.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">group_no_obs</text>
+<text x="155.4" y="285.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">4/4</text>
+<rect x="254.8" y="55.0" width="170.8" height="180.0" rx="4" fill="#0f766e"/>
+<text x="340.1" y="48.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="700" fill="#111827">100%</text>
+<text x="340.1" y="257.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">cubes</text>
+<text x="340.1" y="271.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">ungroup_no_obs</text>
+<text x="340.1" y="285.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">4/4</text>
+<rect x="439.5" y="55.0" width="170.8" height="180.0" rx="4" fill="#0f766e"/>
+<text x="524.9" y="48.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="700" fill="#111827">100%</text>
+<text x="524.9" y="257.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">tabung</text>
+<text x="524.9" y="271.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">group_no_obs</text>
+<text x="524.9" y="285.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">4/4</text>
+<rect x="624.2" y="55.0" width="170.8" height="180.0" rx="4" fill="#0f766e"/>
+<text x="709.6" y="48.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="700" fill="#111827">100%</text>
+<text x="709.6" y="257.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">tabung</text>
+<text x="709.6" y="271.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">ungroup_no_obs</text>
+<text x="709.6" y="285.0" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#374151">4/4</text>
 </svg>

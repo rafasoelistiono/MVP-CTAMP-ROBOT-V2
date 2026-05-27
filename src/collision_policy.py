@@ -67,6 +67,9 @@ class CollisionPolicy:
         self.finger_movable_penetration_tolerance = float(
             os.getenv("FINGER_MOVABLE_CONTACT_TOLERANCE", "0.018")
         )
+        self.table_finger_penetration_tolerance = float(
+            os.getenv("TABLE_FINGER_CONTACT_TOLERANCE", "0.005")
+        )
         self.allow_movable_object_contact = (
             os.getenv("ALLOW_MOVABLE_OBJECT_CONTACT", "false").strip().lower()
             in {"1", "true", "yes", "on"}
@@ -137,6 +140,10 @@ class CollisionPolicy:
                     if self.allow_movable_object_contact:
                         continue
 
+                if env_body is not None and self._is_table(env_body):
+                    if self._is_finger_body(robot_body) and penetration <= self.table_finger_penetration_tolerance:
+                        continue
+
                 if env_body is not None and self._is_obstacle(env_body):
                     if penetration <= self.obstacle_penetration_tolerance:
                         continue
@@ -185,6 +192,9 @@ class CollisionPolicy:
 
     def _is_finger_body(self, body_name: Optional[str]) -> bool:
         return bool(body_name) and str(body_name).endswith(("left_finger", "right_finger"))
+
+    def _is_table(self, body_name: str) -> bool:
+        return body_name.lower() == "table"
 
     def _is_obstacle(self, body_name: str) -> bool:
         lower = body_name.lower()

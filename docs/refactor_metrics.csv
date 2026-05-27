@@ -4,7 +4,13 @@ progress,Before refactor,tabung group_no_obs,,,2,4,0.5,circle3/circle4 gagal pic
 progress,Refactor 1,cubes group_no_obs,,,0,4,0.0,Pinocchio frame mismatch,
 progress,Refactor 2,cubes group_no_obs,,,4,4,1.0,Pinocchio base-frame + grasp fix,
 progress,Refactor 2,tabung group_no_obs,,,4,4,1.0,candidate retry + object guards,
+progress,Before Refactor 3,cubes group_obs,,,1,4,0.25,NEAR skip + place slip near obstacle,align_cubes_group_obs_20260527_215406.csv
+progress,Before Refactor 3,tabung group_obs,,,1,4,0.25,NEAR skip + cylinder displaced,align_tabung_group_obs_20260527_205059.csv
+progress,Refactor 3,cubes group_obs,,,4,4,1.0,validated obstacle mapping + cautious obs execution,align_cubes_group_obs_20260527_221340.csv
+progress,Refactor 3,tabung group_obs,,,4,4,1.0,validated obstacle mapping + cylinder retry restore,align_tabung_group_obs_20260527_221940.csv
 final,,,cubes,group_no_obs,4,4,1.0,,align_cubes_group_no_obs_20260527_204557.csv
 final,,,cubes,ungroup_no_obs,4,4,1.0,,align_cubes_ungroup_no_obs_20260527_205745.csv
 final,,,tabung,group_no_obs,4,4,1.0,,align_tabung_group_no_obs_20260527_204857.csv
 final,,,tabung,ungroup_no_obs,4,4,1.0,,align_tabung_ungroup_no_obs_20260527_205443.csv
+final,,,cubes,group_obs,4,4,1.0,,align_cubes_group_obs_20260527_221340.csv
+final,,,tabung,group_obs,4,4,1.0,,align_tabung_group_obs_20260527_221940.csv

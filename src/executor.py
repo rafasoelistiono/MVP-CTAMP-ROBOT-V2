@@ -96,6 +96,9 @@ PICK_GRASP_OFFSET_SEQUENCE = (0.10, 0.10, 0.10)
 PICK_CLEARANCE_BONUS_SEQUENCE = (0.0, 0.035, 0.06)
 COMPACT_CYLINDER_PICK_GRIP_SEQUENCE = (0.014, 0.012, 0.010)
 COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE = (0.105, 0.095, 0.085)
+CYLINDER_RETRY_MIN_GRASP_OFFSET = float(os.getenv("CYLINDER_RETRY_MIN_GRASP_OFFSET", "0.095"))
+OBSTACLE_CAUTIOUS_CUBE_GRIP = float(os.getenv("OBSTACLE_CAUTIOUS_CUBE_GRIP", "0.011"))
+OBSTACLE_CAUTIOUS_CYLINDER_GRIP = float(os.getenv("OBSTACLE_CAUTIOUS_CYLINDER_GRIP", "0.012"))
 HELD_Z_THRESHOLD = 0.90
 IK_PLAN_POS_ERR_LIMIT = CONFIG.ik_plan_pos_err_limit
 IK_PREGRASP_POS_ERR_LIMIT = CONFIG.ik_pregrasp_pos_err_limit
@@ -1326,13 +1329,13 @@ def _move_pose_safe(
 # SAFETY / GRIPPER HELPERS
 # =============================
 
-def _recover_to_safe_hover() -> None:
+def _recover_to_safe_hover(ignored_body_names: Optional[Sequence[str]] = None) -> None:
     """Move away from table/contact states before retrying another pick."""
-    log_event("RECOVERY", "START", phase="safe_hover")
+    log_event("RECOVERY", "START", phase="safe_hover", ignored_body_names=list(ignored_body_names or []))
     ok = _move_with_ompl(
         goal_q=GRASP_READY,
         grip=0.04,
-        ignored_body_names=None,
+        ignored_body_names=ignored_body_names,
         planner_name=DEFAULT_PLANNER_NAME,
         time_limit=max(DEFAULT_TIME_LIMIT, 2.0),
         label="recovery safe_hover",
@@ -1380,15 +1383,16 @@ def set_grip(target: float, steps: int = 200):
         viewer.sync()
 
 
-def drop():
+def drop(ignored_body_name: Optional[str] = None):
     """Emergency release at the current arm position."""
     global _held_grip_target
-    _log_arm_state("DROP", "START", object_id=_held_object_name)
+    ignored = [ignored_body_name] if ignored_body_name else None
+    _log_arm_state("DROP", "START", object_id=_held_object_name or ignored_body_name, ignored_body_names=ignored or [])
     set_grip(0.04, steps=300)
     for _ in range(120):
         mujoco.mj_step(model, data)
         viewer.sync()
-    _recover_to_safe_hover()
+    _recover_to_safe_hover(ignored_body_names=ignored)
     _held_grip_target = 0.015
     _log_arm_state("DROP", "OK")
 
@@ -1455,6 +1459,8 @@ def pick(obj):
     if is_circle:
         grip_target = COMPACT_CYLINDER_PICK_GRIP_SEQUENCE[profile_index]
         grasp_offset = COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE[profile_index]
+        if profile_index > 0:
+            grasp_offset = max(grasp_offset, CYLINDER_RETRY_MIN_GRASP_OFFSET)
     _log_arm_state(
         "PICK_PROFILE",
         "SELECT",
@@ -1513,6 +1519,10 @@ def pick(obj):
     if obstacle_distance < CAUTIOUS_OBSTACLE_CLEARANCE:
         cautious_motion = True
         approach_clearance += 0.06
+        grip_target = min(
+            grip_target,
+            OBSTACLE_CAUTIOUS_CYLINDER_GRIP if is_circle else OBSTACLE_CAUTIOUS_CUBE_GRIP,
+        )
         print(
             f"[exec][OBSTACLE_AVOID] {obj} near obstacle "
             f"distance={obstacle_distance:.3f}m; using cautious high-clearance approach"
@@ -1523,6 +1533,7 @@ def pick(obj):
             object_id=obj,
             obstacle_distance=obstacle_distance,
             approach_clearance=approach_clearance,
+            grip=grip_target,
         )
     else:
         _log_arm_state(
@@ -1607,7 +1618,7 @@ def pick(obj):
     ):
         # If lift planning fails after grasping, release immediately and let the
         # closed-loop system replan from the table state.
-        drop()
+        drop(obj)
         _held_object_name = None
         _log_arm_state("PICK", "FAILED", object_id=obj, phase="lift", target_xyz=_round_vec(lift_xyz, 4), failure_reason="move_lift_failed")
         return
@@ -1617,7 +1628,7 @@ def pick(obj):
     if not lifted:
         print(f"[exec][PICK_RETRY] {obj} not lifted after grasp z={z:.3f}; release and retry")
         _log_arm_state("PICK", "FAILED", object_id=obj, phase="lift_check", failure_reason="object_not_lifted", object_z=round(z, 4))
-        drop()
+        drop(obj)
         _held_object_name = None
         return
     _log_arm_state("PICK", "OK", object_id=obj, object_z=round(z, 4))
@@ -1691,7 +1702,7 @@ def place(x, y, obj=None):
         label=f"place({x:.3f}, {y:.3f}) preplace",
         cautious_motion=cautious_motion,
     ):
-        drop()
+        drop(obj)
         _held_object_name = None
         _log_arm_state("PLACE", "FAILED", object_id=obj, phase="preplace", target_xyz=_round_vec(preplace_xyz, 4), failure_reason="move_preplace_failed")
         return
@@ -1705,7 +1716,7 @@ def place(x, y, obj=None):
         label=f"place({x:.3f}, {y:.3f}) release",
         cautious_motion=cautious_motion,
     ):
-        drop()
+        drop(obj)
         _held_object_name = None
         _log_arm_state("PLACE", "FAILED", object_id=obj, phase="release", target_xyz=_round_vec(release_xyz, 4), failure_reason="move_release_failed")
         return

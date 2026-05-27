@@ -28,6 +28,19 @@ def test_static_no_obstacle_cylinder_targets_are_reachable():
     assert all(object_id in slots for object_id in move_order)
 
 
+def test_group_obstacle_targets_keep_all_objects_after_validated_mapping():
+    scene = prepare_scene_variant("group_obs")
+    _, cube_order, cube_slots, cube_skipped = _build_aligned_cube_targets(str(scene))
+    _, cylinder_order, cylinder_slots, cylinder_skipped = _build_aligned_cylinder_targets(str(scene))
+
+    assert cube_order == ["cube1", "cube2", "cube3", "cube4"]
+    assert cylinder_order == ["circle1", "circle2", "circle3", "circle4"]
+    assert not cube_skipped
+    assert not cylinder_skipped
+    assert all(object_id in cube_slots for object_id in cube_order)
+    assert all(object_id in cylinder_slots for object_id in cylinder_order)
+
+
 def test_ompl_dependent_regression_is_explicitly_skipped_when_missing():
     if importlib.util.find_spec("ompl") is None:
         pytest.skip("OMPL Python bindings are not installed in this environment")
