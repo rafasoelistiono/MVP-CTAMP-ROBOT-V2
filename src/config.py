@@ -43,7 +43,16 @@ class AppConfig:
     model_file: Path = MODELS_DIR / "panda.xml"
     enable_viewer: bool = True
 
+    ik_backend: str = "auto"
+    ik_require_pinocchio: bool = False
+    ik_plan_pos_err_limit: float = 0.020
+    ik_pregrasp_pos_err_limit: float = 0.030
+    # Orientation error is measured as angle between hand z-axis and desired z-axis.
+    ik_plan_ori_err_limit: float = 0.35
+    ik_pregrasp_ori_err_limit: float = 0.50
+
     ompl_enabled: bool = True
+    ompl_required: bool = False
     ompl_planner_name: str = "RRTConnect"
     ompl_fragile_planner_name: str = "BITstar"
     ompl_time_limit: float = 3.0
@@ -66,7 +75,14 @@ def load_config() -> AppConfig:
     return AppConfig(
         model_file=model_file,
         enable_viewer=_env_bool("ENABLE_VIEWER", True),
+        ik_backend=os.getenv("IK_BACKEND", "auto"),
+        ik_require_pinocchio=_env_bool("IK_REQUIRE_PINOCCHIO", False),
+        ik_plan_pos_err_limit=_env_float("IK_PLAN_POS_ERR_LIMIT", 0.020),
+        ik_pregrasp_pos_err_limit=_env_float("IK_PREGRASP_POS_ERR_LIMIT", 0.030),
+        ik_plan_ori_err_limit=_env_float("IK_PLAN_ORI_ERR_LIMIT", 0.35),
+        ik_pregrasp_ori_err_limit=_env_float("IK_PREGRASP_ORI_ERR_LIMIT", 0.50),
         ompl_enabled=_env_bool("OMPL_ENABLED", True),
+        ompl_required=_env_bool("OMPL_REQUIRED", False),
         ompl_planner_name=os.getenv("OMPL_PLANNER_NAME", "RRTConnect"),
         ompl_fragile_planner_name=os.getenv("OMPL_FRAGILE_PLANNER_NAME", "BITstar"),
         ompl_time_limit=_env_float("OMPL_TIME_LIMIT", 3.0),

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import csv
-import copy
 import json
 import time
 import xml.etree.ElementTree as ET
+from collections import Counter
 from pathlib import Path
 from typing import Iterable
 
@@ -14,12 +14,25 @@ MODELS_DIR = ROOT_DIR / "models"
 GENERATED_DIR = MODELS_DIR
 
 CONSERVATIVE_MOTION_DEFAULTS = {
-    "OMPL_TIME_LIMIT": "5.0",
-    "OMPL_WAYPOINT_STEP": "0.012",
+    "IK_BACKEND": "auto",
+    "IK_PLAN_POS_ERR_LIMIT": "0.020",
+    "IK_PREGRASP_POS_ERR_LIMIT": "0.030",
+    "IK_PLAN_ORI_ERR_LIMIT": "0.35",
+    "IK_PREGRASP_ORI_ERR_LIMIT": "0.50",
+    "MAX_VALID_IK_CANDIDATES": "6",
+    "MAX_IK_ATTEMPTS_PER_SEGMENT": "80",
+    "MIN_PICK_OBJECT_Z": "0.70",
+    "MAX_PICK_OBJECT_XY_DISTANCE": "0.92",
+    "OMPL_PLANNER_NAME": "RRTConnect",
+    "OMPL_FRAGILE_PLANNER_NAME": "BITstar",
+    "OMPL_TIME_LIMIT": "6.0",
+    "OMPL_STATE_VALIDITY_RESOLUTION": "0.004",
+    "OMPL_WAYPOINT_STEP": "0.010",
     "SETTLE_STEPS_PER_WAYPOINT": "14",
     "FINAL_SETTLE_STEPS": "40",
     "MIN_PICK_OBSTACLE_CLEARANCE": "0.18",
     "CAUTIOUS_OBSTACLE_CLEARANCE": "0.24",
+    "FINGER_MOVABLE_CONTACT_TOLERANCE": "0.018",
     "ALLOW_MOVABLE_OBJECT_CONTACT": "false",
 }
 
@@ -46,10 +59,6 @@ GOAL_HALF_SIZE_Y = 0.20
 GOAL_EXCLUSION_MARGIN = 0.04
 COMPACT_CYLINDER_CENTER_Z = 0.84
 COMPACT_CYLINDER_SIZE = (0.026, 0.04)
-TWO_ARM_BASES = {
-    "left": (-0.4, -0.45, 0.8),
-    "right": (-0.4, 0.45, 0.8),
-}
 
 VARIANT_OBJECTS = {
     "group_no_obs": {
@@ -115,6 +124,14 @@ def normalize_scene_key(raw: str | Iterable[str] | None) -> str:
     return normalized
 
 
+def obstacle_mode_for_scene(scene_key: str) -> str:
+    if scene_key.endswith("_no_obs"):
+        return "no_obs"
+    if scene_key.endswith("_obs"):
+        return "obs"
+    return "unknown"
+
+
 def prepare_scene_variant(raw: str | Iterable[str] | None) -> Path:
     scene_key = normalize_scene_key(raw)
     _validate_variant(scene_key)
@@ -156,60 +173,6 @@ def prepare_scene_variant(raw: str | Iterable[str] | None) -> Path:
     return out_path
 
 
-def prepare_two_arm_scene_variant(raw: str | Iterable[str] | None) -> Path:
-    scene_key = normalize_scene_key(raw)
-    _validate_variant(scene_key)
-    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = GENERATED_DIR / f"panda_two_arm_{scene_key}.xml"
-
-    tree = ET.parse(MODELS_DIR / "panda.xml")
-    root = tree.getroot()
-    worldbody = root.find("worldbody")
-    if worldbody is None:
-        raise RuntimeError("models/panda.xml has no worldbody")
-
-    removable_prefixes = ("cube", "circle", "obstacle", "vase", "glass", "ceramic")
-    for body in list(worldbody.findall("body")):
-        name = body.get("name", "")
-        if name == "goal_area" or name.startswith(removable_prefixes):
-            worldbody.remove(body)
-
-    left_arm = None
-    link0_index = 0
-    for idx, body in enumerate(list(worldbody)):
-        if body.tag == "body" and body.get("name") == "link0":
-            left_arm = body
-            link0_index = idx
-            break
-    if left_arm is None:
-        raise RuntimeError("models/panda.xml has no link0 arm body")
-
-    left_arm.set("pos", _fmt_vec(TWO_ARM_BASES["left"]))
-    right_arm = copy.deepcopy(left_arm)
-    right_arm.set("pos", _fmt_vec(TWO_ARM_BASES["right"]))
-    _prefix_robot_tree(right_arm, "right_")
-
-    inserts = [_goal_area_body()]
-    for object_name, pos in VARIANT_OBJECTS[scene_key].items():
-        inserts.append(_movable_body(object_name, pos))
-    if scene_key in {"group_obs", "ungroup_obs"}:
-        for obstacle_name, pos in OBSTACLE_POSITIONS.items():
-            inserts.append(_obstacle_body(obstacle_name, pos))
-
-    for offset, body in enumerate(inserts):
-        worldbody.insert(link0_index + offset, body)
-    worldbody.insert(link0_index + len(inserts) + 1, right_arm)
-
-    _duplicate_right_arm_controls(root)
-    _remove_keyframes(root)
-
-    _indent(root)
-    tmp_path = out_path.with_suffix(".tmp")
-    tree.write(tmp_path, encoding="utf-8", xml_declaration=False)
-    tmp_path.replace(out_path)
-    return out_path
-
-
 def write_summary_csv(task_name: str, scene_key: str, summary: dict, log_dir: str | Path = "logs") -> Path:
     out_dir = Path(log_dir)
     if not out_dir.is_absolute():
@@ -218,14 +181,31 @@ def write_summary_csv(task_name: str, scene_key: str, summary: dict, log_dir: st
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     out_path = out_dir / f"{task_name}_{scene_key}_{timestamp}.csv"
+    failed = list(summary.get("failed", []))
+    objects_moved = int(summary.get("objects_moved") or 0)
+    objects_total = int(summary.get("objects_total") or objects_moved + len(failed))
+    success_rate = objects_moved / objects_total if objects_total else 0.0
+    obstacle_mode = summary.get("obstacle_mode") or obstacle_mode_for_scene(scene_key)
+    scenario_type = summary.get("scenario_type") or "static"
+    failure_counts = Counter(_summary_failure_reason(item) for item in failed)
     row = {
         "task": task_name,
         "scene": scene_key,
+        "scenario_type": scenario_type,
+        "obstacle_mode": obstacle_mode,
         "success": summary.get("success"),
-        "objects_moved": summary.get("objects_moved"),
-        "objects_total": summary.get("objects_total"),
-        "failed_count": len(summary.get("failed", [])),
-        "failed_json": json.dumps(summary.get("failed", []), ensure_ascii=False),
+        "success_count": objects_moved,
+        "failure_count": len(failed),
+        "objects_moved": objects_moved,
+        "objects_total": objects_total,
+        "object_success_rate": round(success_rate, 4),
+        "no_obs_success_rate": round(success_rate, 4) if obstacle_mode == "no_obs" else "",
+        "obs_success_rate": round(success_rate, 4) if obstacle_mode == "obs" else "",
+        "static_success_rate": round(success_rate, 4) if scenario_type == "static" else "",
+        "random_success_rate": round(success_rate, 4) if scenario_type == "random" else "",
+        "failed_count": len(failed),
+        "failure_reason_counts_json": json.dumps(dict(sorted(failure_counts.items())), ensure_ascii=False),
+        "failed_json": json.dumps(failed, ensure_ascii=False),
         "duration_ms": summary.get("duration_ms"),
         "llm_used": "false",
     }
@@ -234,6 +214,17 @@ def write_summary_csv(task_name: str, scene_key: str, summary: dict, log_dir: st
         writer.writeheader()
         writer.writerow(row)
     return out_path
+
+
+def _summary_failure_reason(item) -> str:
+    if isinstance(item, dict):
+        reason = item.get("failure_reason")
+        if reason:
+            return str(reason)
+        stage = item.get("stage")
+        if stage:
+            return f"{stage}_failed"
+    return "unknown"
 
 
 def make_event_log_path(task_name: str, scene_key: str, log_dir: str | Path = "logs") -> Path:
@@ -320,70 +311,6 @@ def _obstacle_body(name: str, pos: tuple[float, float, float]) -> ET.Element:
         </body>
         """
     )
-
-
-def _fmt_vec(values: tuple[float, ...]) -> str:
-    return " ".join(f"{value:g}" for value in values)
-
-
-def _prefix_robot_tree(elem: ET.Element, prefix: str) -> None:
-    name = elem.get("name")
-    if name:
-        elem.set("name", f"{prefix}{name}")
-    for child in elem:
-        _prefix_robot_tree(child, prefix)
-
-
-def _duplicate_right_arm_controls(root: ET.Element) -> None:
-    actuator = root.find("actuator")
-    if actuator is not None:
-        for ctrl in list(actuator):
-            duplicated = copy.deepcopy(ctrl)
-            joint_name = duplicated.get("joint")
-            if joint_name:
-                duplicated.set("joint", f"right_{joint_name}")
-            name = duplicated.get("name")
-            if name:
-                duplicated.set("name", f"right_{name}")
-            actuator.append(duplicated)
-
-    tendon = root.find("tendon")
-    if tendon is not None:
-        for fixed in list(tendon):
-            duplicated = copy.deepcopy(fixed)
-            name = duplicated.get("name")
-            duplicated.set("name", f"right_{name or 'split'}")
-            for joint in duplicated.findall(".//joint"):
-                joint_name = joint.get("joint")
-                if joint_name:
-                    joint.set("joint", f"right_{joint_name}")
-            tendon.append(duplicated)
-
-    equality = root.find("equality")
-    if equality is not None:
-        for constraint in list(equality):
-            duplicated = copy.deepcopy(constraint)
-            for attr in ("joint1", "joint2", "body1", "body2"):
-                value = duplicated.get(attr)
-                if value:
-                    duplicated.set(attr, f"right_{value}")
-            equality.append(duplicated)
-
-    contact = root.find("contact")
-    if contact is not None:
-        for exclude in list(contact):
-            duplicated = copy.deepcopy(exclude)
-            for attr in ("body1", "body2"):
-                value = duplicated.get(attr)
-                if value:
-                    duplicated.set(attr, f"right_{value}")
-            contact.append(duplicated)
-
-
-def _remove_keyframes(root: ET.Element) -> None:
-    keyframe = root.find("keyframe")
-    if keyframe is not None:
-        root.remove(keyframe)
 
 
 def _indent(elem: ET.Element, level: int = 0) -> None:

@@ -1,4 +1,8 @@
 mujoco_env/
+.venv/
 .env
 __pycache__/
 *.py[cod]
+logs/
+MUJOCO_LOG.TXT
+models/generated/

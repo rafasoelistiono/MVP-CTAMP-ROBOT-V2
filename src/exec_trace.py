@@ -13,23 +13,50 @@ _EVENT_ID = 0
 _CSV_PATH = os.getenv("CTAMP_EVENT_LOG_CSV", "").strip()
 _CONSOLE = os.getenv("CTAMP_TRACE_CONSOLE", "true").strip().lower() not in {"0", "false", "no", "off"}
 _BUFFER: list[dict[str, Any]] = []
-_FLUSH_EVERY = int(os.getenv("CTAMP_TRACE_FLUSH_EVERY", "25"))
+_FLUSH_EVERY = int(os.getenv("CTAMP_TRACE_FLUSH_EVERY", "1"))
 _FIELDNAMES = [
     "event_id",
     "timestamp",
     "stage",
     "status",
+    "arm",
     "object_id",
     "phase",
     "label",
+    "scenario_type",
+    "obstacle_mode",
+    "backend",
     "planner",
+    "attempt",
+    "candidate_id",
+    "seed_id",
     "waypoints",
     "duration_ms",
     "grip",
     "target_xyz",
+    "actual_xyz",
+    "ee_xyz",
+    "object_xyz",
+    "object_z",
+    "held_object",
+    "finger_pos",
+    "q",
+    "q_target",
+    "q_error_norm",
+    "pos_err",
+    "ori_err",
+    "iterations",
+    "distance_to_target",
+    "joint_limit_valid",
+    "state_valid",
+    "state_invalid_reason",
+    "ompl_result",
+    "execution_result",
     "ignored_body_names",
     "failure_reason",
     "collision_pair",
+    "contact_count",
+    "penetration",
     "obstacle_distance",
     "extra_json",
 ]
@@ -95,7 +122,7 @@ def _format_console(row: dict[str, Any]) -> str:
         f"{str(row['stage'])[:24]:<24}",
         f"{str(row['status'])[:8]:<8}",
     ]
-    for key in ("object_id", "phase", "planner", "waypoints", "duration_ms", "failure_reason"):
+    for key in ("arm", "object_id", "phase", "backend", "planner", "attempt", "waypoints", "duration_ms", "failure_reason"):
         value = row.get(key)
         if value not in (None, ""):
             parts.append(f"{key}={value}")

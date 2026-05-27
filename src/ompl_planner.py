@@ -258,12 +258,26 @@ class PandaOMPLPlanner:
         finally:
             self._planning_start_q = None
 
-    def is_state_valid_q(self, q: Sequence[float]) -> bool:
+    def is_state_valid_q(
+        self,
+        q: Sequence[float],
+        ignored_body_names: Optional[Sequence[str]] = None,
+    ) -> bool:
         """Direct validity check for a 7-DoF joint vector."""
         q = np.asarray(q, dtype=float).reshape(-1)
         if q.shape[0] != self.ndof:
             return False
-        return self._is_state_valid(self._q_to_state(q))
+        if ignored_body_names is None:
+            return self._is_state_valid(self._q_to_state(q))
+
+        previous_ignored = set(self._ignored_body_names)
+        self._ignored_body_names = set(ignored_body_names)
+        self.collision_policy.set_ignored_bodies(self._ignored_body_names)
+        try:
+            return self._is_state_valid(self._q_to_state(q))
+        finally:
+            self._ignored_body_names = previous_ignored
+            self.collision_policy.set_ignored_bodies(self._ignored_body_names)
 
     # ------------------------------------------------------------------
     # OMPL helpers

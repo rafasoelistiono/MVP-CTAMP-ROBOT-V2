@@ -21,6 +21,7 @@ from ctamp_task_utils import (
     apply_conservative_motion_defaults,
     make_event_log_path,
     normalize_scene_key,
+    obstacle_mode_for_scene,
     prepare_scene_variant,
     write_summary_csv,
 )
@@ -62,6 +63,23 @@ def _reach_status(obj, world_state) -> str:
     return "OK"
 
 
+def _runtime_object_pose(executor, object_id: str):
+    executor.mujoco.mj_forward(executor.model, executor.data)
+    pos = executor.data.xpos[executor.name_to_cube[object_id]]
+    return [float(pos[0]), float(pos[1]), float(pos[2])]
+
+
+def _terminal_pick_failure_reason(executor, object_id: str, world_state) -> str | None:
+    pos = _runtime_object_pose(executor, object_id)
+    table_top = float(world_state["table"]["z_top"])
+    reach_distance = math.dist(pos[:2], world_state["robot"]["base_xy"])
+    if pos[2] < table_top - 0.08:
+        return "object_displaced_below_table"
+    if reach_distance > world_state["robot"]["reach_max_m"] + 0.10:
+        return "object_outside_robot_reach_after_displacement"
+    return None
+
+
 def _reachable(x: float, y: float, world_state) -> bool:
     robot = world_state["robot"]
     bx, by = robot["base_xy"]
@@ -74,6 +92,49 @@ def _clear_from_ceramic(x: float, y: float, radius: float, world_state) -> bool:
         if math.dist((x, y), tuple(region["center_xy"])) < region["radius"] + radius:
             return False
     return True
+
+
+def _target_xy_ok(x: float, y: float, radius: float, world_state, occupied=()) -> bool:
+    table = world_state["table"]
+    if not (table["x_range"][0] < x < table["x_range"][1] and table["y_range"][0] < y < table["y_range"][1]):
+        return False
+    if not _reachable(x, y, world_state):
+        return False
+    if not _clear_from_ceramic(x, y, radius, world_state):
+        return False
+    for ox, oy, other_radius in occupied:
+        if math.dist((x, y), (ox, oy)) < radius + other_radius + 0.018:
+            return False
+    return True
+
+
+def _search_safe_target_xy(base_x: float, base_y: float, radius: float, world_state, occupied=()):
+    table = world_state["table"]
+    x_min, x_max = table["x_range"]
+    y_min, y_max = table["y_range"]
+    candidates = []
+    for ring in range(0, 7):
+        for dx in range(-ring, ring + 1):
+            for dy in range(-ring, ring + 1):
+                if ring and abs(dx) != ring and abs(dy) != ring:
+                    continue
+                x = min(max(base_x + dx * 0.035, x_min + radius), x_max - radius)
+                y = min(max(base_y + dy * 0.035, y_min + radius), y_max - radius)
+                candidates.append((x, y))
+
+    seen = set()
+    unique = []
+    for x, y in candidates:
+        key = (round(x, 4), round(y, 4))
+        if key not in seen:
+            seen.add(key)
+            unique.append((x, y))
+
+    unique.sort(key=lambda xy: abs(xy[1] - base_y) * 3.0 + abs(xy[0] - base_x))
+    for x, y in unique:
+        if _target_xy_ok(x, y, radius, world_state, occupied):
+            return x, y
+    return None
 
 
 def _parse_scene(scene_file: str):
@@ -257,22 +318,27 @@ def _build_aligned_cube_targets(scene_file: str, spacing: float = 0.11):
     row_y = goal_y - 0.065
     start_x = goal_x - spacing * (len(eligible_cubes) - 1) / 2.0
     slots = {}
+    occupied = []
     for index, cube in enumerate(eligible_cubes):
         radius = cube.get("radius", 0.043)
-        x = start_x + index * spacing
-        y = row_y
-        if not (table["x_range"][0] < x < table["x_range"][1] and table["y_range"][0] < y < table["y_range"][1]):
-            raise ValueError(f"target keluar meja untuk {cube['id']}: {(x, y)}")
-        if not _reachable(x, y, world_state):
-            raise ValueError(f"target di luar reach arm untuk {cube['id']}: {(x, y)}")
-        if not _clear_from_ceramic(x, y, radius, world_state):
-            raise ValueError(f"target terlalu dekat ceramic untuk {cube['id']}: {(x, y)}")
+        base_x = start_x + index * spacing
+        target_xy = _search_safe_target_xy(base_x, row_y, radius, world_state, occupied)
+        if target_xy is None:
+            skipped.append({
+                "object_id": cube["id"],
+                "stage": "target_allocation",
+                "failure_reason": "no_safe_aligned_target_found",
+                "desired_xy": [round(base_x, 4), round(row_y, 4)],
+            })
+            continue
+        x, y = target_xy
+        occupied.append((x, y, radius))
         slots[cube["id"]] = {
             "slot_id": f"line_slot_{index + 1:02d}",
             "target_pose": [round(x, 4), round(y, 4), round(table["z_top"] + 0.03, 4), 1.0, 0.0, 0.0, 0.0],
         }
 
-    return world_state, [cube["id"] for cube in eligible_cubes], slots, skipped
+    return world_state, list(slots.keys()), slots, skipped
 
 
 def main() -> int:
@@ -282,7 +348,7 @@ def main() -> int:
     parser.add_argument("--object", nargs="+", default=["group", "no", "obs"], help="Scene: group no obs, ungroup no obs, group obs, ungroup obs.")
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--no-viewer", action="store_true")
-    parser.add_argument("--place-retries", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--place-retries", type=int, default=2, help=argparse.SUPPRESS)
     parser.add_argument("--settle-after-place", type=int, default=300, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -291,6 +357,8 @@ def main() -> int:
     event_csv_path = make_event_log_path("align_cubes", scene_key, args.log_dir)
     os.environ["MODEL_FILE"] = str(scene_file)
     os.environ["CTAMP_EVENT_LOG_CSV"] = str(event_csv_path)
+    os.environ["CTAMP_SCENARIO_TYPE"] = "static"
+    os.environ["CTAMP_OBSTACLE_MODE"] = obstacle_mode_for_scene(scene_key)
     os.environ.setdefault("OMPL_ENABLED", "true")
     os.environ.setdefault("USE_IK_FALLBACK", "false")
     apply_conservative_motion_defaults()
@@ -345,6 +413,19 @@ def main() -> int:
     if not getattr(executor, "_OMPL_AVAILABLE", False):
         print("[ALIGN_CUBES] Executor tidak melihat OMPL planner aktif.")
         return 2
+
+    log_event(
+        "TASK_CONTEXT",
+        "START",
+        phase="align_cubes",
+        scene=scene_key,
+        model_file=str(scene_file),
+        move_order=move_order,
+        targets={object_id: slots_by_object[object_id]["target_pose"] for object_id in move_order},
+        skipped_precheck=skipped_precheck,
+        movable_count=world_state["counts"]["movable"],
+        ceramic_count=world_state["counts"]["ceramic"],
+    )
 
     started = time.perf_counter()
     moved = []
@@ -419,10 +500,20 @@ def main() -> int:
             executor.pick(object_id)
             pick_ok, pick_z = feedback.check_pick(executor.model, executor.data, executor.name_to_cube[object_id])
             print(f"[{index:02d}] CHECK_PICK   {'OK' if pick_ok else 'FAIL'} attempt={pick_attempts[object_id]} z={pick_z}")
+            log_event(
+                "CHECK_PICK",
+                "OK" if pick_ok else "FAILED",
+                object_id=object_id,
+                phase="pick",
+                attempt=pick_attempts[object_id],
+                object_z=pick_z,
+                failure_reason=None if pick_ok else "object_not_lifted_after_pick",
+            )
             if not pick_ok:
+                terminal_reason = _terminal_pick_failure_reason(executor, object_id, world_state)
                 executor.drop()
                 _settle(executor, args.settle_after_place)
-                if pick_attempts[object_id] < max_pick_attempts:
+                if terminal_reason is None and pick_attempts[object_id] < max_pick_attempts:
                     print(
                         f"[{index:02d}] DEFER_OBJECT object={object_id} reason=pick_failed "
                         f"attempts={pick_attempts[object_id]}/{max_pick_attempts}; try_next_candidate"
@@ -438,10 +529,13 @@ def main() -> int:
                     )
                     pending.append(object_id)
                 else:
+                    actual_pos = _runtime_object_pose(executor, object_id)
                     failed.append({
                         "object_id": object_id,
                         "stage": "pick",
+                        "failure_reason": terminal_reason or "object_not_lifted_after_pick",
                         "z": pick_z,
+                        "actual": [round(v, 4) for v in actual_pos],
                         "attempts": pick_attempts[object_id],
                     })
                 continue
@@ -455,6 +549,18 @@ def main() -> int:
                 _settle(executor, args.settle_after_place)
                 place_ok, actual = feedback.check_place(executor.model, executor.data, executor.name_to_cube[object_id], x, y)
                 print(f"[{index:02d}] CHECK_PLACE  {'OK' if place_ok else 'FAIL'} retry={retry} actual={actual}")
+                place_error = math.dist((actual[0], actual[1]), (x, y)) if actual else None
+                log_event(
+                    "CHECK_PLACE",
+                    "OK" if place_ok else "FAILED",
+                    object_id=object_id,
+                    phase="place",
+                    attempt=retry,
+                    target_xyz=[round(x, 4), round(y, 4), round(float(target_pose[2]), 4)],
+                    actual_xyz=actual,
+                    distance_to_target=round(place_error, 4) if place_error is not None else None,
+                    failure_reason=None if place_ok else "object_not_on_target_after_place",
+                )
                 if place_ok:
                     break
                 executor.drop()
@@ -464,7 +570,12 @@ def main() -> int:
                 moved.append(object_id)
                 _settle(executor, args.settle_after_place)
             else:
-                failed.append({"object_id": object_id, "stage": "place", "actual": actual})
+                failed.append({
+                    "object_id": object_id,
+                    "stage": "place",
+                    "failure_reason": "object_not_on_target_after_place",
+                    "actual": actual,
+                })
 
     duration_ms = int((time.perf_counter() - started) * 1000)
     success = len(failed) == 0
@@ -484,6 +595,8 @@ def main() -> int:
             "objects_total": len(move_order) + len(skipped_precheck),
             "failed": failed,
             "duration_ms": duration_ms,
+            "scenario_type": "static",
+            "obstacle_mode": obstacle_mode_for_scene(scene_key),
         },
         args.log_dir,
     )

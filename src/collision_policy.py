@@ -30,6 +30,7 @@ class CollisionReport:
     geom2: Optional[int] = None
     body1: Optional[str] = None
     body2: Optional[str] = None
+    penetration: float = 0.0
 
     @property
     def reason(self) -> str:
@@ -62,6 +63,9 @@ class CollisionPolicy:
             float(os.getenv("OBSTACLE_CONTACT_TOLERANCE", "0.003"))
             if obstacle_penetration_tolerance is None
             else float(obstacle_penetration_tolerance)
+        )
+        self.finger_movable_penetration_tolerance = float(
+            os.getenv("FINGER_MOVABLE_CONTACT_TOLERANCE", "0.018")
         )
         self.allow_movable_object_contact = (
             os.getenv("ALLOW_MOVABLE_OBJECT_CONTACT", "false").strip().lower()
@@ -117,6 +121,8 @@ class CollisionPolicy:
                 body1 = self._body_name_for_geom(geom1)
                 body2 = self._body_name_for_geom(geom2)
                 env_body = body2 if geom1_robot else body1
+                robot_body = body1 if geom1_robot else body2
+                penetration = max(0.0, -float(contact.dist))
 
                 if env_body in self.ignored_body_names:
                     continue
@@ -126,11 +132,12 @@ class CollisionPolicy:
                 # circles are treated as obstacles so transit paths do not bump
                 # through unrelated objects.
                 if env_body is not None and self._is_movable_object(env_body):
+                    if self._is_finger_body(robot_body) and penetration <= self.finger_movable_penetration_tolerance:
+                        continue
                     if self.allow_movable_object_contact:
                         continue
 
                 if env_body is not None and self._is_obstacle(env_body):
-                    penetration = max(0.0, -float(contact.dist))
                     if penetration <= self.obstacle_penetration_tolerance:
                         continue
 
@@ -140,6 +147,7 @@ class CollisionPolicy:
                     geom2=geom2,
                     body1=body1,
                     body2=body2,
+                    penetration=penetration,
                 )
 
         return CollisionReport(valid=True)
@@ -174,6 +182,9 @@ class CollisionPolicy:
     def _is_movable_object(self, body_name: str) -> bool:
         lower = body_name.lower()
         return lower.startswith(("cube", "circle")) and not self._is_obstacle(lower)
+
+    def _is_finger_body(self, body_name: Optional[str]) -> bool:
+        return bool(body_name) and str(body_name).endswith(("left_finger", "right_finger"))
 
     def _is_obstacle(self, body_name: str) -> bool:
         lower = body_name.lower()

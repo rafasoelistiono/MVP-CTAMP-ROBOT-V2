@@ -11,11 +11,31 @@ import numpy as np
 from config import CONFIG
 from collision_policy import CollisionPolicy
 from exec_trace import log_event
+from ik_diagnostics import (
+    IKAttemptResult,
+    IK_GOAL_STATE_INVALID,
+    IK_SUCCESS,
+    IK_UNREACHABLE,
+    OMPL_TIMEOUT,
+    classify_ik_attempt,
+    joint_limits_valid,
+    rank_ik_attempts,
+)
 
 try:
     from ompl_planner import make_default_panda_planner
 except ImportError:
     make_default_panda_planner = None
+
+try:
+    import pinocchio as pin
+    from robot_descriptions.loaders.pinocchio import load_robot_description
+except ImportError as _pinocchio_import_error:
+    pin = None
+    load_robot_description = None
+    _PINOCCHIO_IMPORT_ERROR = _pinocchio_import_error
+else:
+    _PINOCCHIO_IMPORT_ERROR = None
 
 
 # =============================
@@ -72,14 +92,27 @@ DEFAULT_TIME_LIMIT = CONFIG.ompl_time_limit
 DEFAULT_SETTLE_STEPS_PER_WP = CONFIG.settle_steps_per_waypoint
 DEFAULT_FINAL_SETTLE_STEPS = CONFIG.final_settle_steps
 PICK_GRIP_SEQUENCE = (0.015, 0.011, 0.008)
-PICK_GRASP_OFFSET_SEQUENCE = (0.10, 0.085, 0.075)
+PICK_GRASP_OFFSET_SEQUENCE = (0.10, 0.10, 0.10)
 PICK_CLEARANCE_BONUS_SEQUENCE = (0.0, 0.035, 0.06)
 COMPACT_CYLINDER_PICK_GRIP_SEQUENCE = (0.014, 0.012, 0.010)
 COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE = (0.105, 0.095, 0.085)
 HELD_Z_THRESHOLD = 0.90
-IK_PLAN_POS_ERR_LIMIT = 0.035
-IK_PREGRASP_POS_ERR_LIMIT = 0.055
+IK_PLAN_POS_ERR_LIMIT = CONFIG.ik_plan_pos_err_limit
+IK_PREGRASP_POS_ERR_LIMIT = CONFIG.ik_pregrasp_pos_err_limit
+IK_PLAN_ORI_ERR_LIMIT = CONFIG.ik_plan_ori_err_limit
+IK_PREGRASP_ORI_ERR_LIMIT = CONFIG.ik_pregrasp_ori_err_limit
 FAR_PICK_XY_DISTANCE = 0.74
+MAX_VALID_IK_CANDIDATES = int(os.getenv("MAX_VALID_IK_CANDIDATES", "6"))
+MAX_IK_ATTEMPTS_PER_SEGMENT = int(os.getenv("MAX_IK_ATTEMPTS_PER_SEGMENT", "80"))
+MIN_PICK_OBJECT_Z = float(os.getenv("MIN_PICK_OBJECT_Z", "0.70"))
+MAX_PICK_OBJECT_XY_DISTANCE = float(os.getenv("MAX_PICK_OBJECT_XY_DISTANCE", "0.92"))
+
+_IK_BACKEND_NAME = "uninitialized"
+_PINOCCHIO_ROBOT = None
+_PINOCCHIO_MODEL = None
+_PINOCCHIO_DATA = None
+_PINOCCHIO_FRAME_ID = None
+_LAST_SUCCESSFUL_SEED: Optional[np.ndarray] = None
 
 _BASE_ROBOT_BODY_NAMES = (
     "link0",
@@ -280,6 +313,57 @@ def _object_lifted(obj: str) -> tuple[bool, float]:
 
 _ompl_planner = None
 _OMPL_AVAILABLE = CONFIG.ompl_enabled and make_default_panda_planner is not None
+log_event(
+    "OMPL_INIT",
+    "OK" if _OMPL_AVAILABLE else "FAILED",
+    enabled=CONFIG.ompl_enabled,
+    failure_reason=None if _OMPL_AVAILABLE else "ompl_unavailable",
+)
+if CONFIG.ompl_required and not _OMPL_AVAILABLE:
+    raise RuntimeError(
+        "OMPL_REQUIRED=true but OMPL planner bindings are unavailable. "
+        "Install OMPL Python bindings in this environment or set OMPL_REQUIRED=false for diagnostics."
+    )
+
+
+def _initialize_ik_backend() -> None:
+    global _IK_BACKEND_NAME, _PINOCCHIO_ROBOT, _PINOCCHIO_MODEL, _PINOCCHIO_DATA, _PINOCCHIO_FRAME_ID
+
+    requested = (CONFIG.ik_backend or "auto").strip().lower()
+    if requested not in {"auto", "pinocchio", "mujoco_dls"}:
+        log_event("IK_INIT", "PINOCCHIO_FAILED", failure_reason=f"unknown IK_BACKEND={CONFIG.ik_backend}")
+        requested = "auto"
+
+    if requested in {"auto", "pinocchio"}:
+        if pin is None or load_robot_description is None:
+            log_event("IK_INIT", "PINOCCHIO_FAILED", failure_reason=str(_PINOCCHIO_IMPORT_ERROR))
+            if CONFIG.ik_require_pinocchio or requested == "pinocchio":
+                raise RuntimeError(
+                    "Pinocchio IK requested but dependencies are unavailable. "
+                    "Install pin and robot_descriptions, or set IK_BACKEND=mujoco_dls for development fallback."
+                )
+        else:
+            try:
+                _PINOCCHIO_ROBOT = load_robot_description("panda_description")
+                _PINOCCHIO_MODEL = getattr(_PINOCCHIO_ROBOT, "model", _PINOCCHIO_ROBOT)
+                _PINOCCHIO_DATA = _PINOCCHIO_MODEL.createData()
+                for frame_name in ("panda_hand", "panda_link8", "panda_hand_tcp"):
+                    frame_id = _PINOCCHIO_MODEL.getFrameId(frame_name)
+                    if frame_id < len(_PINOCCHIO_MODEL.frames):
+                        _PINOCCHIO_FRAME_ID = frame_id
+                        break
+                if _PINOCCHIO_FRAME_ID is None:
+                    raise RuntimeError("Pinocchio Panda model has no panda_hand-compatible frame")
+                _IK_BACKEND_NAME = "pinocchio"
+                log_event("IK_INIT", "PINOCCHIO_OK", frame=_PINOCCHIO_MODEL.frames[_PINOCCHIO_FRAME_ID].name)
+                return
+            except Exception as exc:
+                log_event("IK_INIT", "PINOCCHIO_FAILED", failure_reason=str(exc))
+                if CONFIG.ik_require_pinocchio or requested == "pinocchio":
+                    raise
+
+    _IK_BACKEND_NAME = "mujoco_dls"
+    log_event("IK_INIT", "MUJOCO_DLS_FALLBACK", failure_reason="pinocchio_unavailable_or_not_requested")
 
 
 def _get_ompl_planner():
@@ -337,6 +421,79 @@ def _sync_plan_data_from_live() -> None:
     mujoco.mj_forward(model, _plan_data)
 
 
+def _round_vec(values, ndigits: int = 4) -> list[float]:
+    return [round(float(v), ndigits) for v in np.asarray(values, dtype=float).reshape(-1)]
+
+
+def _ee_xyz() -> list[float]:
+    mujoco.mj_forward(model, data)
+    return _round_vec(data.xpos[ee_id], 4)
+
+
+def _object_xyz(obj: Optional[str]) -> Optional[list[float]]:
+    if obj is None or obj not in name_to_cube:
+        return None
+    mujoco.mj_forward(model, data)
+    return _round_vec(data.xpos[name_to_cube[obj]], 4)
+
+
+def _arm_q() -> list[float]:
+    return _round_vec(current_q(), 4)
+
+
+def _finger_snapshot() -> float:
+    try:
+        return round(_finger_pos(), 4)
+    except Exception:
+        return 0.0
+
+
+def _distance_xy_to_base(pos: Sequence[float]) -> float:
+    return round(float(np.linalg.norm(np.asarray(pos[:2], dtype=float) - BASE_XY)), 4)
+
+
+def _object_pose_failure_reason(pos: Sequence[float]) -> Optional[str]:
+    pos_arr = np.asarray(pos, dtype=float).reshape(3)
+    if float(pos_arr[2]) < MIN_PICK_OBJECT_Z:
+        return "object_displaced_below_table"
+    if float(np.linalg.norm(pos_arr[:2] - BASE_XY)) > MAX_PICK_OBJECT_XY_DISTANCE:
+        return "object_outside_robot_reach_after_displacement"
+    return None
+
+
+def _desired_orientation_error_from_matrix(rot_matrix: np.ndarray) -> float:
+    z_axis = np.asarray(rot_matrix, dtype=float).reshape(3, 3)[:, 2]
+    denom = max(float(np.linalg.norm(z_axis) * np.linalg.norm(_DESIRED_Z)), 1e-9)
+    cos_angle = float(np.clip(np.dot(z_axis, _DESIRED_Z) / denom, -1.0, 1.0))
+    return float(np.arccos(cos_angle))
+
+
+def _mujoco_fk_error(q: Sequence[float], target_xyz: Sequence[float]) -> tuple[float, float, list[float]]:
+    q_arr = clip_arm(np.asarray(q, dtype=float).reshape(-1))
+    _plan_data.qpos[:] = data.qpos[:]
+    _plan_data.qvel[:] = 0.0
+    _plan_data.qpos[arm_qpos_adr] = q_arr
+    mujoco.mj_forward(model, _plan_data)
+    ee_pos = _plan_data.xpos[ee_id].copy()
+    pos_err = float(np.linalg.norm(np.asarray(target_xyz, dtype=float).reshape(3) - ee_pos))
+    ori_err = _desired_orientation_error_from_matrix(_plan_data.xmat[ee_id].reshape(3, 3))
+    return pos_err, ori_err, _round_vec(ee_pos, 4)
+
+
+def _log_arm_state(stage: str, status: str, **fields) -> None:
+    obj = fields.get("object_id") or fields.get("held_object") or _held_object_name
+    fields.setdefault("arm", ACTIVE_ARM)
+    fields.setdefault("scenario_type", os.getenv("CTAMP_SCENARIO_TYPE", "static"))
+    fields.setdefault("obstacle_mode", os.getenv("CTAMP_OBSTACLE_MODE", "unknown"))
+    fields.setdefault("ee_xyz", _ee_xyz())
+    fields.setdefault("q", _arm_q())
+    fields.setdefault("finger_pos", _finger_snapshot())
+    fields.setdefault("held_object", _held_object_name)
+    if obj is not None and "object_xyz" not in fields:
+        fields["object_xyz"] = _object_xyz(str(obj))
+    log_event(stage, status, **fields)
+
+
 def _set_arm_ctrl(q: np.ndarray, grip: float) -> None:
     data.ctrl[arm_ctrl_adr] = clip_arm(np.asarray(q, dtype=float))
     data.ctrl[finger_ctrl_adr] = float(grip)
@@ -368,22 +525,26 @@ def _check_live_collision(
     if report.valid:
         return True
     if allow_start_table_finger and _is_table_finger_pair(report):
-        log_event(
+        _log_arm_state(
             "COLLISION_CHECK",
             "IGNORED_START",
             phase=context,
             failure_reason=report.reason,
             collision_pair=[report.body1, report.body2],
+            contact_count=int(data.ncon),
+            penetration=round(float(getattr(report, "penetration", 0.0)), 5),
             ignored_body_names=list(ignored_body_names or []),
         )
         return True
     print(f"[collision] blocked during {context}: {report.reason}")
-    log_event(
+    _log_arm_state(
         "COLLISION_CHECK",
         "BLOCKED",
         phase=context,
         failure_reason=report.reason,
         collision_pair=[report.body1, report.body2],
+        contact_count=int(data.ncon),
+        penetration=round(float(getattr(report, "penetration", 0.0)), 5),
         ignored_body_names=list(ignored_body_names or []),
     )
     return False
@@ -440,7 +601,7 @@ def _ik_solve_to(
         ori_error = np.cross(R[:, 2], _DESIRED_Z)
 
         pos_norm = float(np.linalg.norm(pos_error))
-        ori_norm = float(np.linalg.norm(ori_error))
+        ori_norm = _desired_orientation_error_from_matrix(R)
 
         info["pos_err_norm"] = pos_norm
         info["ori_err_norm"] = ori_norm
@@ -471,7 +632,121 @@ def _ik_solve_to(
         dq = np.clip(dq_task + dq_null, -0.08, 0.08)
         q_target = clip_arm(q_target + 0.015 * dq)
 
+    info["backend"] = "mujoco_dls"
     return clip_arm(q_target), info
+
+
+def _pinocchio_ik_solve_to(
+    target_xyz: Sequence[float],
+    q_seed: Optional[Sequence[float]] = None,
+    steps: int = 120,
+    pos_tol: float = 0.006,
+    ori_tol: float = 0.25,
+) -> Tuple[np.ndarray, dict]:
+    if _PINOCCHIO_MODEL is None or _PINOCCHIO_DATA is None or _PINOCCHIO_FRAME_ID is None:
+        raise RuntimeError("Pinocchio IK backend is not initialized")
+
+    nq = int(_PINOCCHIO_MODEL.nq)
+    nv = int(_PINOCCHIO_MODEL.nv)
+    q = np.zeros(nq, dtype=float)
+    seed = np.asarray(q_seed if q_seed is not None else current_q(), dtype=float).reshape(-1)
+    q[: min(seed.shape[0], nq)] = seed[: min(seed.shape[0], nq)]
+    if nq > 7:
+        q[7:] = 0.04
+
+    target_world_xyz = np.asarray(target_xyz, dtype=float).reshape(3)
+    target_xyz = target_world_xyz - _pinocchio_base_translation()
+    info = {
+        "converged": False,
+        "pos_err_norm": float("inf"),
+        "ori_err_norm": float("inf"),
+        "iters": 0,
+        "backend": "pinocchio",
+    }
+
+    damping = 1e-4
+    for it in range(steps):
+        pin.forwardKinematics(_PINOCCHIO_MODEL, _PINOCCHIO_DATA, q)
+        pin.updateFramePlacements(_PINOCCHIO_MODEL, _PINOCCHIO_DATA)
+        frame = _PINOCCHIO_DATA.oMf[_PINOCCHIO_FRAME_ID]
+        pos_error = target_xyz - np.asarray(frame.translation).reshape(3)
+        pos_norm = float(np.linalg.norm(pos_error))
+        ori_norm = _desired_orientation_error_from_matrix(np.asarray(frame.rotation))
+        info.update({
+            "converged": pos_norm <= pos_tol and ori_norm <= ori_tol,
+            "pos_err_norm": pos_norm,
+            "ori_err_norm": ori_norm,
+            "iters": it + 1,
+        })
+        if info["converged"]:
+            break
+
+        jac = pin.computeFrameJacobian(
+            _PINOCCHIO_MODEL,
+            _PINOCCHIO_DATA,
+            q,
+            _PINOCCHIO_FRAME_ID,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
+        jpos = jac[:3, :nv]
+        lhs = jpos @ jpos.T + damping * np.eye(3)
+        dq = jpos.T @ np.linalg.solve(lhs, pos_error)
+        dq = np.clip(dq, -0.12, 0.12)
+        q = pin.integrate(_PINOCCHIO_MODEL, q, dq)
+
+    return clip_arm(q[:7]), info
+
+
+def _pinocchio_base_translation() -> np.ndarray:
+    prefix = _arm_prefix(ACTIVE_ARM)
+    return np.asarray(model.body(f"{prefix}link0").pos[:3], dtype=float)
+
+
+def _solve_ik_to(
+    target_xyz,
+    null_ref=None,
+    q_seed=None,
+    steps=800,
+    pos_limit: Optional[float] = None,
+    ori_limit: Optional[float] = None,
+):
+    if _IK_BACKEND_NAME == "pinocchio":
+        try:
+            seed = q_seed if q_seed is not None else null_ref
+            pin_q, pin_info = _pinocchio_ik_solve_to(target_xyz, q_seed=seed, steps=180)
+            fk_pos_err, fk_ori_err, _ = _mujoco_fk_error(pin_q, target_xyz)
+            max_pos = float(pos_limit if pos_limit is not None else IK_PLAN_POS_ERR_LIMIT)
+            max_ori = float(ori_limit if ori_limit is not None else IK_PLAN_ORI_ERR_LIMIT)
+            if fk_pos_err <= max_pos and fk_ori_err <= max_ori:
+                return pin_q, pin_info
+
+            dls_q, dls_info = _ik_solve_to(target_xyz, null_ref=null_ref, q_seed=q_seed, steps=steps)
+            dls_pos_err, dls_ori_err, _ = _mujoco_fk_error(dls_q, target_xyz)
+            use_dls = (
+                (dls_pos_err <= max_pos and dls_ori_err <= max_ori)
+                or (dls_pos_err + 0.15 * dls_ori_err < fk_pos_err + 0.15 * fk_ori_err)
+            )
+            log_event(
+                "IK_SOLVE",
+                "BACKEND_FALLBACK",
+                backend="pinocchio",
+                failure_reason="pinocchio_fk_validation_failed",
+                pos_err=round(float(fk_pos_err), 5),
+                ori_err=round(float(fk_ori_err), 5),
+                pos_limit=max_pos,
+                ori_limit=max_ori,
+                fallback_backend="mujoco_dls",
+                dls_pos_err=round(float(dls_pos_err), 5),
+                dls_ori_err=round(float(dls_ori_err), 5),
+                use_dls=use_dls,
+            )
+            if use_dls:
+                return dls_q, dls_info
+            return pin_q, pin_info
+        except Exception as exc:
+            log_event("IK_SOLVE", "BACKEND_FALLBACK", backend="pinocchio", failure_reason=str(exc))
+    return _ik_solve_to(target_xyz, null_ref=null_ref, q_seed=q_seed, steps=steps)
+
 
 def _solve_safe_goal_candidates(target_xyz, base_null_ref, label=""):
     planner = _get_ompl_planner()
@@ -535,6 +810,16 @@ def _target_xyz_candidates(target_xyz: Sequence[float], label: str) -> list[np.n
 
         if "grasp" in label and "pregrasp" not in label:
             candidates.extend(base + offset + np.array([0.0, 0.0, -0.01]) for offset in xy_offsets[:2])
+    elif label.startswith("place("):
+        xy_offsets = [
+            np.array([0.018, 0.0, 0.0]),
+            np.array([-0.018, 0.0, 0.0]),
+            np.array([0.0, 0.018, 0.0]),
+            np.array([0.0, -0.018, 0.0]),
+        ]
+        candidates.extend(base + offset for offset in xy_offsets)
+        if "release" in label:
+            candidates.extend(base + np.array([0.0, 0.0, z]) for z in (0.015, -0.015))
     return candidates
 
 
@@ -544,60 +829,147 @@ def _ik_pos_limit_for_label(label: str) -> float:
     return IK_PLAN_POS_ERR_LIMIT
 
 
+def _ik_ori_limit_for_label(label: str) -> float:
+    if label.startswith("pick(") and "pregrasp" in label:
+        return IK_PREGRASP_ORI_ERR_LIMIT
+    return IK_PLAN_ORI_ERR_LIMIT
+
+
 def _null_ref_candidates(null_ref: Optional[np.ndarray]) -> list[np.ndarray]:
     base_ref = np.asarray(null_ref if null_ref is not None else GRASP_READY, dtype=float).copy()
-    refs = [base_ref, _ELBOW_UP_REF.copy()]
+    refs = [current_q(), base_ref, GRASP_READY.copy(), _ELBOW_UP_REF.copy()]
+    if _LAST_SUCCESSFUL_SEED is not None:
+        refs.append(_LAST_SUCCESSFUL_SEED.copy())
     for delta in (0.18, -0.18):
         ref = base_ref.copy()
         ref[1] = np.clip(ref[1] + delta, arm_ranges[1, 0], arm_ranges[1, 1])
         refs.append(ref)
-    return refs
+    unique = []
+    seen = set()
+    for ref in refs:
+        clipped = clip_arm(ref)
+        key = tuple(np.round(clipped, 4))
+        if key not in seen:
+            seen.add(key)
+            unique.append(clipped)
+    return unique
+
+
+def _ranked_ik_goals(
+    target_xyz: Sequence[float],
+    null_ref: Optional[np.ndarray],
+    label: str,
+    ignored_body_names: Optional[Sequence[str]] = None,
+) -> list[IKAttemptResult]:
+    planner = _get_ompl_planner()
+    pos_limit = _ik_pos_limit_for_label(label)
+    ori_limit = _ik_ori_limit_for_label(label)
+    attempts: list[IKAttemptResult] = []
+
+    for candidate_idx, xyz in enumerate(_target_xyz_candidates(target_xyz, label)):
+        for seed_idx, ref in enumerate(_null_ref_candidates(null_ref)):
+            q_seed = current_q() if seed_idx == 0 else ref
+            q, info = _solve_ik_to(
+                xyz,
+                null_ref=ref,
+                q_seed=q_seed,
+                pos_limit=pos_limit,
+                ori_limit=ori_limit,
+            )
+            fk_pos_err, fk_ori_err, fk_ee_xyz = _mujoco_fk_error(q, xyz)
+            pos_err = fk_pos_err
+            ori_err = fk_ori_err
+            joint_ok = joint_limits_valid(q, arm_ranges[:, 0], arm_ranges[:, 1])
+            state_valid = None
+            state_reason = None
+            if planner is not None and joint_ok:
+                state_valid = planner.is_state_valid_q(q, ignored_body_names=ignored_body_names)
+                state_reason = getattr(planner, "_last_invalid_reason", None)
+            reason = classify_ik_attempt(
+                pos_err=pos_err,
+                ori_err=ori_err,
+                pos_limit=pos_limit,
+                ori_limit=ori_limit,
+                joint_limit_valid=joint_ok,
+                state_valid=state_valid,
+                state_invalid_reason=state_reason,
+                converged=bool(info.get("converged", False)) or np.isfinite(pos_err),
+            )
+            score = (
+                pos_err
+                + 0.15 * ori_err
+                + 0.02 * float(np.linalg.norm(np.asarray(q, dtype=float) - current_q()))
+            )
+            if label.startswith("pick(") and "grasp" in label and "pregrasp" not in label:
+                score += 1.5 * float(np.linalg.norm(np.asarray(xyz, dtype=float) - np.asarray(target_xyz, dtype=float)))
+            attempt = IKAttemptResult(
+                q=q,
+                target_xyz=np.asarray(xyz, dtype=float),
+                backend=str(info.get("backend", _IK_BACKEND_NAME)),
+                candidate_id=candidate_idx,
+                seed_id=seed_idx,
+                pos_err=pos_err,
+                ori_err=ori_err,
+                iterations=int(info.get("iters", 0)),
+                converged=bool(info.get("converged", False)),
+                joint_limit_valid=joint_ok,
+                state_valid=state_valid,
+                state_invalid_reason=state_reason,
+                failure_reason=reason,
+                score=score,
+            )
+            attempts.append(attempt)
+            log_event(
+                "IK_CANDIDATE",
+                "OK" if reason == IK_SUCCESS else "REJECT",
+                arm=ACTIVE_ARM,
+                phase=label,
+                target_xyz=[round(float(v), 4) for v in xyz],
+                actual_xyz=fk_ee_xyz,
+                ee_xyz=_ee_xyz(),
+                q=_round_vec(q, 4),
+                q_error_norm=round(float(np.linalg.norm(np.asarray(q, dtype=float) - current_q())), 5),
+                pos_err=round(pos_err, 5),
+                ori_err=round(ori_err, 5),
+                iterations=info.get("iters", 0),
+                candidate_idx=candidate_idx,
+                candidate_id=candidate_idx,
+                seed_id=seed_idx,
+                backend=info.get("backend", _IK_BACKEND_NAME),
+                pos_limit=pos_limit,
+                ori_limit=ori_limit,
+                converged=info.get("converged", False),
+                joint_limit_valid=joint_ok,
+                state_valid=state_valid,
+                state_invalid_reason=state_reason,
+                failure_reason=None if reason == IK_SUCCESS else reason,
+                score=round(score, 5),
+            )
+            valid_count = sum(1 for item in attempts if item.failure_reason == IK_SUCCESS)
+            if valid_count >= MAX_VALID_IK_CANDIDATES:
+                return rank_ik_attempts(attempts)
+            if len(attempts) >= MAX_IK_ATTEMPTS_PER_SEGMENT and valid_count > 0:
+                return rank_ik_attempts(attempts)
+
+    return rank_ik_attempts(attempts)
 
 
 def _select_ik_goal(target_xyz: Sequence[float], null_ref: Optional[np.ndarray], label: str):
-    planner = _get_ompl_planner()
-    best = None
-    best_score = float("inf")
-    pos_limit = _ik_pos_limit_for_label(label)
-
-    for candidate_idx, xyz in enumerate(_target_xyz_candidates(target_xyz, label)):
-        for ref_idx, ref in enumerate(_null_ref_candidates(null_ref)):
-            q, info = _ik_solve_to(xyz, null_ref=ref, q_seed=ref if ref_idx else None)
-            pos_err = float(info["pos_err_norm"] or float("inf"))
-            ori_err = float(info["ori_err_norm"] or float("inf"))
-            score = pos_err + 0.25 * ori_err
-            log_event(
-                "IK_CANDIDATE",
-                "OK" if pos_err <= IK_PLAN_POS_ERR_LIMIT else "REJECT",
-                phase=label,
-                target_xyz=[round(float(v), 4) for v in xyz],
-                pos_err=round(pos_err, 5),
-                ori_err=round(ori_err, 5),
-                candidate_idx=candidate_idx,
-                ref_idx=ref_idx,
-                pos_limit=pos_limit,
-            )
-
-            if score < best_score:
-                best = (q, info, xyz)
-                best_score = score
-
-            if pos_err > pos_limit:
-                continue
-            if planner is not None and not planner.is_state_valid_q(q):
-                log_event("IK_CANDIDATE", "INVALID_GOAL", phase=label, candidate_idx=candidate_idx, ref_idx=ref_idx)
-                continue
-            return q, info, xyz
-
-    if best is None:
-        return None, None, None
-    q, info, xyz = best
-    if float(info["pos_err_norm"] or float("inf")) > pos_limit:
-        return None, info, xyz
-    if planner is not None and not planner.is_state_valid_q(q):
-        log_event("IK_CANDIDATE", "NO_VALID_GOAL", phase=label, pos_limit=pos_limit)
-        return None, info, xyz
-    return q, info, xyz
+    ranked = _ranked_ik_goals(target_xyz, null_ref, label)
+    valid = [item for item in ranked if item.failure_reason == IK_SUCCESS]
+    if not valid:
+        return None, None, None, IK_UNREACHABLE
+    best = valid[0]
+    info = {
+        "backend": best.backend,
+        "pos_err_norm": best.pos_err,
+        "ori_err_norm": best.ori_err,
+        "iters": best.iterations,
+        "converged": best.converged,
+        "candidate_id": best.candidate_id,
+        "seed_id": best.seed_id,
+    }
+    return best.q, info, best.target_xyz, IK_SUCCESS
 
 # =============================
 # OMPL EXECUTION
@@ -611,14 +983,16 @@ def _execute_joint_trajectory(
     final_settle_steps: int = DEFAULT_FINAL_SETTLE_STEPS,
 ) -> bool:
     if traj is None or len(traj) == 0:
-        log_event("TRAJECTORY_EXEC", "SKIP", waypoints=0, grip=grip)
+        _log_arm_state("TRAJECTORY_EXEC", "SKIP", waypoints=0, grip=grip)
         return True
 
-    log_event(
+    _log_arm_state(
         "TRAJECTORY_EXEC",
         "START",
         waypoints=len(traj),
         grip=grip,
+        q_target=_round_vec(traj[-1], 4),
+        q_error_norm=round(float(np.linalg.norm(clip_arm(np.asarray(traj[-1], dtype=float)) - current_q())), 5),
         ignored_body_names=list(ignored_body_names or []),
         settle_steps_per_wp=settle_steps_per_wp,
         final_settle_steps=final_settle_steps,
@@ -627,12 +1001,14 @@ def _execute_joint_trajectory(
     for waypoint_index, q in enumerate(traj):
         q = clip_arm(np.asarray(q, dtype=float))
         if waypoint_index in {0, len(traj) - 1} or waypoint_index % max(1, len(traj) // 4) == 0:
-            log_event(
+            _log_arm_state(
                 "TRAJECTORY_WAYPOINT",
                 "EXEC",
                 waypoints=f"{waypoint_index + 1}/{len(traj)}",
                 grip=grip,
                 q=[round(float(v), 4) for v in q],
+                q_target=[round(float(v), 4) for v in traj[-1]],
+                q_error_norm=round(float(np.linalg.norm(q - current_q())), 5),
             )
         for _ in range(settle_steps_per_wp):
             _set_arm_ctrl(q, grip)
@@ -643,12 +1019,14 @@ def _execute_joint_trajectory(
                 ignored_body_names=ignored_body_names,
                 allow_start_table_finger=waypoint_index == 0,
             ):
-                log_event(
+                _log_arm_state(
                     "TRAJECTORY_EXEC",
                     "FAILED",
                     waypoints=len(traj),
                     duration_ms=int((time.perf_counter() - started) * 1000),
                     failure_reason=f"collision_at_waypoint_{waypoint_index}",
+                    q_target=_round_vec(q, 4),
+                    q_error_norm=round(float(np.linalg.norm(q - current_q())), 5),
                 )
                 return False
 
@@ -662,20 +1040,24 @@ def _execute_joint_trajectory(
                 context="trajectory final settle",
                 ignored_body_names=ignored_body_names,
             ):
-                log_event(
+                _log_arm_state(
                     "TRAJECTORY_EXEC",
                     "FAILED",
                     waypoints=len(traj),
                     duration_ms=int((time.perf_counter() - started) * 1000),
                     failure_reason="collision_during_final_settle",
+                    q_target=_round_vec(final_q, 4),
+                    q_error_norm=round(float(np.linalg.norm(final_q - current_q())), 5),
                 )
                 return False
 
-    log_event(
+    _log_arm_state(
         "TRAJECTORY_EXEC",
         "OK",
         waypoints=len(traj),
         duration_ms=int((time.perf_counter() - started) * 1000),
+        q_target=_round_vec(traj[-1], 4),
+        q_error_norm=round(float(np.linalg.norm(clip_arm(np.asarray(traj[-1], dtype=float)) - current_q())), 5),
     )
     return True
 
@@ -695,74 +1077,127 @@ def _move_with_ompl(
 
     if not _OMPL_AVAILABLE:
         print("[exec][OMPL] unavailable")
-        log_event("OMPL_PLAN", "UNAVAILABLE", phase=label, failure_reason="ompl_unavailable")
+        _log_arm_state("OMPL_PLAN", "UNAVAILABLE", phase=label, failure_reason="ompl_unavailable", q_target=_round_vec(goal_q, 4))
         return False
 
     planner = _get_ompl_planner()
     if planner is None:
         print("[exec][OMPL] planner init failed")
-        log_event("OMPL_PLAN", "FAILED", phase=label, failure_reason="planner_init_failed")
+        _log_arm_state("OMPL_PLAN", "FAILED", phase=label, failure_reason="planner_init_failed", q_target=_round_vec(goal_q, 4))
         return False
 
+    planner_attempts = []
+    for candidate in (planner_name, CONFIG.ompl_fragile_planner_name, "BITstar", "RRTConnect"):
+        if candidate and candidate not in planner_attempts:
+            planner_attempts.append(candidate)
+
+    start_state_valid = planner.is_state_valid_q(start_q)
+    start_state_reason = getattr(planner, "_last_invalid_reason", None)
+    last_info = None
     try:
-        log_event(
+        _log_arm_state(
             "OMPL_PLAN",
             "START",
             phase=label,
-            planner=planner_name,
+            planner=planner_attempts[0],
             grip=grip,
             ignored_body_names=list(ignored_body_names or []),
             time_limit=time_limit,
             start_q=[round(float(v), 4) for v in start_q],
             goal_q=[round(float(v), 4) for v in goal_q],
+            q_target=_round_vec(goal_q, 4),
+            q_error_norm=round(float(np.linalg.norm(goal_q - start_q)), 5),
+            planner_attempts=planner_attempts,
+            start_state_valid=start_state_valid,
+            start_state_invalid_reason=start_state_reason,
         )
         started = time.perf_counter()
-        traj, info = planner.plan(
-            start_q=start_q,
-            goal_q=goal_q,
-            time_limit=time_limit,
-            planner_name=planner_name,
-            ignored_body_names=ignored_body_names,
-            fragile_mode=True,
-        )
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        if traj is None:
-            print(f"[exec][OMPL] planning failed: {info}")
-            log_event(
-                "OMPL_PLAN",
-                "FAILED",
-                phase=label,
-                planner=info.get("planner_name", planner_name),
-                duration_ms=duration_ms,
-                failure_reason="no_solution_path",
-                goal_attempts=info.get("goal_attempts"),
+        for attempt_index, attempt_planner in enumerate(planner_attempts, start=1):
+            traj, info = planner.plan(
+                start_q=start_q,
+                goal_q=goal_q,
+                time_limit=time_limit,
+                planner_name=attempt_planner,
+                ignored_body_names=ignored_body_names,
+                fragile_mode=attempt_planner == CONFIG.ompl_fragile_planner_name,
             )
-            return False
+            last_info = info
+            if traj is None:
+                attempt_duration_ms = int((time.perf_counter() - started) * 1000)
+                goal_attempts = info.get("goal_attempts") or []
+                statuses = [item.get("status") for item in goal_attempts if isinstance(item, dict)]
+                if statuses and all(status == "invalid_goal" for status in statuses):
+                    failure_reason = IK_GOAL_STATE_INVALID
+                elif attempt_duration_ms >= int(time_limit * 950):
+                    failure_reason = OMPL_TIMEOUT
+                else:
+                    failure_reason = "ompl_no_path_found"
+                _log_arm_state(
+                    "OMPL_PLAN_ATTEMPT",
+                    "FAILED",
+                    phase=label,
+                    planner=info.get("planner_name", attempt_planner),
+                    attempt=attempt_index,
+                    failure_reason=failure_reason,
+                    ompl_result=failure_reason,
+                    goal_attempts=goal_attempts,
+                    q_target=_round_vec(goal_q, 4),
+                    q_error_norm=round(float(np.linalg.norm(goal_q - current_q())), 5),
+                )
+                continue
 
-        print(
-            f"[exec][OMPL] solved={info.get('solved')} "
-            f"planner={info.get('planner_name')} waypoints={info.get('num_waypoints')}"
-        )
-        log_event(
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            print(
+                f"[exec][OMPL] solved={info.get('solved')} "
+                f"planner={info.get('planner_name')} waypoints={info.get('num_waypoints')}"
+            )
+            _log_arm_state(
+                "OMPL_PLAN",
+                "OK",
+                phase=label,
+                planner=info.get("planner_name"),
+                waypoints=info.get("num_waypoints"),
+                duration_ms=duration_ms,
+                path_length=round(float(info.get("path_length_joint_space", 0.0)), 4),
+                selected_goal_q=info.get("selected_goal_q"),
+                q_target=_round_vec(info.get("selected_goal_q", goal_q), 4),
+                q_error_norm=round(float(np.linalg.norm(np.asarray(info.get("selected_goal_q", goal_q), dtype=float) - current_q())), 5),
+                ompl_result="success",
+            )
+            return _execute_joint_trajectory(
+                traj,
+                grip=grip,
+                ignored_body_names=ignored_body_names,
+                settle_steps_per_wp=settle_steps_per_wp,
+                final_settle_steps=final_settle_steps,
+            )
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        goal_attempts = (last_info or {}).get("goal_attempts") or []
+        statuses = [item.get("status") for item in goal_attempts if isinstance(item, dict)]
+        if statuses and all(status == "invalid_goal" for status in statuses):
+            failure_reason = IK_GOAL_STATE_INVALID
+        elif duration_ms >= int(time_limit * 950):
+            failure_reason = OMPL_TIMEOUT
+        else:
+            failure_reason = "ompl_no_path_found"
+        print(f"[exec][OMPL] planning failed: {last_info}")
+        _log_arm_state(
             "OMPL_PLAN",
-            "OK",
+            "FAILED",
             phase=label,
-            planner=info.get("planner_name"),
-            waypoints=info.get("num_waypoints"),
+            planner=(last_info or {}).get("planner_name", planner_name),
             duration_ms=duration_ms,
-            path_length=round(float(info.get("path_length_joint_space", 0.0)), 4),
-            selected_goal_q=info.get("selected_goal_q"),
+            failure_reason=failure_reason,
+            ompl_result=failure_reason,
+            goal_attempts=goal_attempts,
+            q_target=_round_vec(goal_q, 4),
+            q_error_norm=round(float(np.linalg.norm(goal_q - current_q())), 5),
         )
-        return _execute_joint_trajectory(
-            traj,
-            grip=grip,
-            ignored_body_names=ignored_body_names,
-            settle_steps_per_wp=settle_steps_per_wp,
-            final_settle_steps=final_settle_steps,
-        )
+        return False
     except Exception as e:
         print(f"[exec][OMPL] error: {e}")
-        log_event("OMPL_PLAN", "ERROR", phase=label, failure_reason=str(e))
+        _log_arm_state("OMPL_PLAN", "ERROR", phase=label, failure_reason=str(e), q_target=_round_vec(goal_q, 4))
         return False
 
 
@@ -774,7 +1209,8 @@ def _move_pose_safe(
     label: str = "",
     cautious_motion: bool = False,
 ) -> bool:
-    log_event(
+    global _LAST_SUCCESSFUL_SEED
+    _log_arm_state(
         "MOVE_POSE",
         "START",
         phase=label,
@@ -782,127 +1218,107 @@ def _move_pose_safe(
         grip=grip,
         ignored_body_names=list(ignored_body_names or []),
     )
-    selected_goal_q, selected_ik_info, selected_xyz = _select_ik_goal(target_xyz, null_ref, label)
-    if selected_goal_q is None:
-        pos_err = float((selected_ik_info or {}).get("pos_err_norm") or float("inf"))
-        ori_err = float((selected_ik_info or {}).get("ori_err_norm") or float("inf"))
+    ranked_attempts = _ranked_ik_goals(
+        target_xyz,
+        null_ref,
+        label,
+        ignored_body_names=ignored_body_names,
+    )
+    valid_attempts = [item for item in ranked_attempts if item.failure_reason == IK_SUCCESS]
+    if not valid_attempts:
+        best_attempt = ranked_attempts[0] if ranked_attempts else None
+        pos_err = float(best_attempt.pos_err if best_attempt is not None else float("inf"))
+        ori_err = float(best_attempt.ori_err if best_attempt is not None else float("inf"))
+        failure_reason = best_attempt.failure_reason if best_attempt is not None else IK_UNREACHABLE
         pos_limit = _ik_pos_limit_for_label(label)
+        ori_limit = _ik_ori_limit_for_label(label)
         print(
             f"[exec][IK] reject {label or 'pose'}: "
-            f"best_pos={pos_err:.4f} best_ori={ori_err:.4f} limit={pos_limit:.3f}"
+            f"best_pos={pos_err:.4f} best_ori={ori_err:.4f} "
+            f"pos_limit={pos_limit:.3f} ori_limit={ori_limit:.3f} reason={failure_reason}"
         )
-        log_event(
+        _log_arm_state(
             "IK_SOLVE",
             "FAILED",
             phase=label,
             target_xyz=[round(float(v), 4) for v in target_xyz],
-            failure_reason="ik_error_above_plan_limit",
+            failure_reason=failure_reason,
             pos_err=round(pos_err, 5) if np.isfinite(pos_err) else None,
             ori_err=round(ori_err, 5) if np.isfinite(ori_err) else None,
             pos_limit=pos_limit,
+            ori_limit=ori_limit,
+            backend=best_attempt.backend if best_attempt is not None else _IK_BACKEND_NAME,
+            candidate_id=best_attempt.candidate_id if best_attempt is not None else None,
+            seed_id=best_attempt.seed_id if best_attempt is not None else None,
         )
         return False
 
-    log_event(
-        "IK_SOLVE",
-        "OK",
-        phase=label,
-        target_xyz=[round(float(v), 4) for v in selected_xyz],
-        pos_err=round(float(selected_ik_info["pos_err_norm"] or 0.0), 5),
-        ori_err=round(float(selected_ik_info["ori_err_norm"] or 0.0), 5),
-        iterations=selected_ik_info["iters"],
-    )
-    ok = _move_with_ompl(
-        goal_q=selected_goal_q,
-        grip=grip,
-        ignored_body_names=ignored_body_names,
-        planner_name=DEFAULT_PLANNER_NAME,
-        time_limit=DEFAULT_TIME_LIMIT * (1.7 if cautious_motion else 1.0),
-        label=label,
-        settle_steps_per_wp=DEFAULT_SETTLE_STEPS_PER_WP * (2 if cautious_motion else 1),
-        final_settle_steps=DEFAULT_FINAL_SETTLE_STEPS * (2 if cautious_motion else 1),
-    )
-    if ok:
-        log_event("MOVE_POSE", "OK", phase=label)
-        return True
-    if USE_IK_FALLBACK:
-        print(f"[exec] OMPL failed for {label or 'pose'}; using IK fallback")
-        log_event("MOVE_POSE", "IK_FALLBACK", phase=label)
-        move_ee_to(selected_xyz, grip=grip, steps=300, null_ref=null_ref)
-        return True
-    print(f"[exec] OMPL failed for {label or 'pose'}; no fallback in fragile-scene mode")
-    log_event("MOVE_POSE", "FAILED", phase=label, failure_reason="ompl_failed_no_fallback")
-    return False
-
-    goal_q, ik_info = _ik_solve_to(target_xyz, null_ref=null_ref)
-    log_event(
-        "IK_SOLVE",
-        "OK" if ik_info["converged"] else "WARN",
-        phase=label,
-        target_xyz=[round(float(v), 4) for v in target_xyz],
-        duration_ms=None,
-        pos_err=round(float(ik_info["pos_err_norm"] or 0.0), 5),
-        ori_err=round(float(ik_info["ori_err_norm"] or 0.0), 5),
-        iterations=ik_info["iters"],
-    )
-    if not ik_info["converged"]:
-        print(
-            f"[exec][IK] warning for {label or 'pose'}: "
-            f"pos={ik_info['pos_err_norm']:.4f} ori={ik_info['ori_err_norm']:.4f} iters={ik_info['iters']}"
-        )
-
-    # If primary IK converged to an elbow-down config (joint2 > 0.55 → link2
-    # may drop below the table at z=0.80) or did not converge, try an elbow-up
-    # seed.  A large joint2 happens for close targets (x≈0.2) where the default
-    # GRASP_READY null-ref drives joint2 to ~0.65, putting link2 at z≈0.74 —
-    # below the table — so OMPL rejects every goal candidate as invalid_goal.
-    _EU_J2_THRESHOLD = 0.55
-    if goal_q[1] > _EU_J2_THRESHOLD or not ik_info["converged"]:
-        eu_ref = _ELBOW_UP_REF.copy()
-        if null_ref is not None:
-            eu_ref[0] = null_ref[0]  # match joint1 direction to target
-        goal_q_eu, ik_info_eu = _ik_solve_to(target_xyz, null_ref=eu_ref, q_seed=eu_ref)
-        log_event(
-            "IK_ELBOW_UP",
-            "OK" if ik_info_eu["converged"] else "FAILED",
+    for goal_attempt, attempt in enumerate(valid_attempts, start=1):
+        selected_goal_q = attempt.q
+        selected_xyz = attempt.target_xyz
+        _log_arm_state(
+            "IK_SOLVE",
+            "OK",
             phase=label,
-            pos_err=round(float(ik_info_eu["pos_err_norm"] or 0.0), 5),
-            ori_err=round(float(ik_info_eu["ori_err_norm"] or 0.0), 5),
-            iterations=ik_info_eu["iters"],
+            target_xyz=[round(float(v), 4) for v in selected_xyz],
+            q_target=_round_vec(selected_goal_q, 4),
+            pos_err=round(float(attempt.pos_err), 5),
+            ori_err=round(float(attempt.ori_err), 5),
+            iterations=attempt.iterations,
+            backend=attempt.backend,
+            candidate_id=attempt.candidate_id,
+            seed_id=attempt.seed_id,
+            goal_attempt=goal_attempt,
         )
-        if ik_info_eu["converged"] and (
-            not ik_info["converged"]
-            or ik_info_eu["pos_err_norm"] < ik_info["pos_err_norm"]
-        ):
-            goal_q, ik_info = goal_q_eu, ik_info_eu
-            print(
-                f"[exec][IK] elbow-up solution for {label or 'pose'}: "
-                f"pos={ik_info['pos_err_norm']:.4f}"
+        ok = _move_with_ompl(
+            goal_q=selected_goal_q,
+            grip=grip,
+            ignored_body_names=ignored_body_names,
+            planner_name=DEFAULT_PLANNER_NAME,
+            time_limit=DEFAULT_TIME_LIMIT * (1.7 if cautious_motion else 1.0),
+            label=label,
+            settle_steps_per_wp=DEFAULT_SETTLE_STEPS_PER_WP * (2 if cautious_motion else 1),
+            final_settle_steps=DEFAULT_FINAL_SETTLE_STEPS * (2 if cautious_motion else 1),
+        )
+        if ok:
+            _LAST_SUCCESSFUL_SEED = np.asarray(selected_goal_q, dtype=float).copy()
+            _log_arm_state(
+                "MOVE_POSE",
+                "OK",
+                phase=label,
+                target_xyz=[round(float(v), 4) for v in selected_xyz],
+                backend=attempt.backend,
+                candidate_id=attempt.candidate_id,
+                seed_id=attempt.seed_id,
+                execution_result="success",
             )
-
-    ok = _move_with_ompl(
-        goal_q=goal_q,
-        grip=grip,
-        ignored_body_names=ignored_body_names,
-        planner_name=DEFAULT_PLANNER_NAME,
-        time_limit=DEFAULT_TIME_LIMIT * (1.7 if cautious_motion else 1.0),
-        label=label,
-        settle_steps_per_wp=DEFAULT_SETTLE_STEPS_PER_WP * (2 if cautious_motion else 1),
-        final_settle_steps=DEFAULT_FINAL_SETTLE_STEPS * (2 if cautious_motion else 1),
-    )
-
-    if ok:
-        log_event("MOVE_POSE", "OK", phase=label)
-        return True
+            return True
+        _log_arm_state(
+            "MOVE_POSE",
+            "RETRY_NEXT_IK_GOAL",
+            phase=label,
+            target_xyz=[round(float(v), 4) for v in selected_xyz],
+            backend=attempt.backend,
+            candidate_id=attempt.candidate_id,
+            seed_id=attempt.seed_id,
+            failure_reason="ompl_or_execution_failed",
+        )
 
     if USE_IK_FALLBACK:
         print(f"[exec] OMPL failed for {label or 'pose'}; using IK fallback")
-        log_event("MOVE_POSE", "IK_FALLBACK", phase=label)
-        move_ee_to(target_xyz, grip=grip, steps=300, null_ref=null_ref)
+        fallback_xyz = valid_attempts[0].target_xyz
+        _log_arm_state("MOVE_POSE", "IK_FALLBACK", phase=label, target_xyz=[round(float(v), 4) for v in fallback_xyz])
+        move_ee_to(fallback_xyz, grip=grip, steps=300, null_ref=null_ref)
         return True
-
     print(f"[exec] OMPL failed for {label or 'pose'}; no fallback in fragile-scene mode")
-    log_event("MOVE_POSE", "FAILED", phase=label, failure_reason="ompl_failed_no_fallback")
+    _log_arm_state(
+        "MOVE_POSE",
+        "FAILED",
+        phase=label,
+        target_xyz=[round(float(v), 4) for v in valid_attempts[0].target_xyz],
+        failure_reason="ompl_failed_no_fallback",
+        execution_result="execution_failed",
+    )
     return False
 
 
@@ -934,14 +1350,18 @@ def _recover_to_safe_hover() -> None:
     log_event("RECOVERY", "OK", phase="safe_hover_direct")
 
 
-def _move_to_grasp_ready(reason: str, grip: float = 0.04) -> bool:
+def _move_to_grasp_ready(
+    reason: str,
+    grip: float = 0.04,
+    ignored_body_names: Optional[Sequence[str]] = None,
+) -> bool:
     if float(np.linalg.norm(current_q() - GRASP_READY)) < 0.05:
         return True
     log_event("TRANSIT", "START", phase=reason, target="GRASP_READY")
     ok = _move_with_ompl(
         goal_q=GRASP_READY,
         grip=grip,
-        ignored_body_names=None,
+        ignored_body_names=ignored_body_names,
         planner_name=DEFAULT_PLANNER_NAME,
         time_limit=max(DEFAULT_TIME_LIMIT, 3.0),
         label=f"transit {reason}",
@@ -963,14 +1383,14 @@ def set_grip(target: float, steps: int = 200):
 def drop():
     """Emergency release at the current arm position."""
     global _held_grip_target
-    log_event("DROP", "START", object_id=_held_object_name)
+    _log_arm_state("DROP", "START", object_id=_held_object_name)
     set_grip(0.04, steps=300)
     for _ in range(120):
         mujoco.mj_step(model, data)
         viewer.sync()
     _recover_to_safe_hover()
     _held_grip_target = 0.015
-    log_event("DROP", "OK")
+    _log_arm_state("DROP", "OK")
 
 
 # =============================
@@ -978,6 +1398,7 @@ def drop():
 # =============================
 
 _initialize_available_arms()
+_initialize_ik_backend()
 
 # Phase 1: HOME.
 log_event("WARMUP", "START", phase="home")
@@ -1013,14 +1434,14 @@ def pick(obj):
     global _held_object_name, _held_grip_target
 
     print(f"[exec] pick({obj})")
-    log_event("PICK", "START", object_id=obj)
+    _log_arm_state("PICK", "START", object_id=obj)
     if obj not in name_to_cube:
         print(f"[exec] unknown object: {obj}")
-        log_event("PICK", "FAILED", object_id=obj, failure_reason="unknown_object")
+        _log_arm_state("PICK", "FAILED", object_id=obj, failure_reason="unknown_object")
         return
 
     if not _move_to_grasp_ready(f"before pick({obj})", grip=0.04):
-        log_event("PICK", "FAILED", object_id=obj, phase="transit", failure_reason="move_to_grasp_ready_failed")
+        _log_arm_state("PICK", "FAILED", object_id=obj, phase="transit", failure_reason="move_to_grasp_ready_failed")
         return
 
     call_count = _pick_call_counts.get(obj, 0)
@@ -1034,7 +1455,7 @@ def pick(obj):
     if is_circle:
         grip_target = COMPACT_CYLINDER_PICK_GRIP_SEQUENCE[profile_index]
         grasp_offset = COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE[profile_index]
-    log_event(
+    _log_arm_state(
         "PICK_PROFILE",
         "SELECT",
         object_id=obj,
@@ -1050,15 +1471,36 @@ def pick(obj):
     _step_sim(80, grip=0.04)
     mujoco.mj_forward(model, data)
     cube_pos = data.xpos[cube_id].copy()
+    pose_failure_reason = _object_pose_failure_reason(cube_pos)
+    if pose_failure_reason is not None:
+        _log_arm_state(
+            "PICK",
+            "FAILED",
+            object_id=obj,
+            phase="precheck",
+            object_xyz=_round_vec(cube_pos, 4),
+            distance_to_target=_distance_xy_to_base(cube_pos),
+            failure_reason=pose_failure_reason,
+        )
+        return
     obstacle_distance = _min_obstacle_xy_distance(cube_pos)
     approach_clearance = APPROACH_CLEARANCE + clearance_bonus
     cautious_motion = False
+    _log_arm_state(
+        "PICK_PRECHECK",
+        "START",
+        object_id=obj,
+        object_xyz=_round_vec(cube_pos, 4),
+        obstacle_distance=obstacle_distance if np.isfinite(obstacle_distance) else None,
+        distance_to_target=_distance_xy_to_base(cube_pos),
+        approach_clearance=approach_clearance,
+    )
     if obstacle_distance < MIN_PICK_OBSTACLE_CLEARANCE:
         print(
             f"[exec][OBSTACLE_AVOID] cancel pick({obj}): "
             f"distance={obstacle_distance:.3f}m threshold={MIN_PICK_OBSTACLE_CLEARANCE:.3f}m"
         )
-        log_event(
+        _log_arm_state(
             "PICK",
             "FAILED",
             object_id=obj,
@@ -1075,7 +1517,7 @@ def pick(obj):
             f"[exec][OBSTACLE_AVOID] {obj} near obstacle "
             f"distance={obstacle_distance:.3f}m; using cautious high-clearance approach"
         )
-        log_event(
+        _log_arm_state(
             "OBSTACLE_AVOID",
             "NEAR_CAUTIOUS",
             object_id=obj,
@@ -1083,7 +1525,7 @@ def pick(obj):
             approach_clearance=approach_clearance,
         )
     else:
-        log_event(
+        _log_arm_state(
             "OBSTACLE_AVOID",
             "CLEAR",
             object_id=obj,
@@ -1093,10 +1535,12 @@ def pick(obj):
 
     cube_ref = cube_null_ref(cube_pos)
     object_xy_distance = float(np.linalg.norm(cube_pos[:2] - BASE_XY))
+    if object_xy_distance > FAR_PICK_XY_DISTANCE:
+        grasp_offset += 0.02
     pregrasp_clearance = approach_clearance
     if object_xy_distance > FAR_PICK_XY_DISTANCE:
         pregrasp_clearance = min(pregrasp_clearance, 0.24)
-        log_event(
+        _log_arm_state(
             "PICK_PROFILE",
             "FAR_PREGRASP",
             object_id=obj,
@@ -1107,6 +1551,16 @@ def pick(obj):
     pregrasp_xyz = cube_pos + np.array([0.0, 0.0, pregrasp_clearance])
     grasp_xyz = cube_pos + np.array([0.0, 0.0, grasp_offset])
     lift_xyz = cube_pos + np.array([0.0, 0.0, approach_clearance])
+    _log_arm_state(
+        "PICK_TARGETS",
+        "SET",
+        object_id=obj,
+        object_xyz=_round_vec(cube_pos, 4),
+        pregrasp_xyz=_round_vec(pregrasp_xyz, 4),
+        grasp_xyz=_round_vec(grasp_xyz, 4),
+        lift_xyz=_round_vec(lift_xyz, 4),
+        cautious_motion=cautious_motion,
+    )
 
     # 1) Move above the cube.
     if not _move_pose_safe(
@@ -1117,7 +1571,7 @@ def pick(obj):
         label=f"pick({obj}) pregrasp",
         cautious_motion=cautious_motion,
     ):
-        log_event("PICK", "FAILED", object_id=obj, phase="pregrasp", failure_reason="move_pregrasp_failed")
+        _log_arm_state("PICK", "FAILED", object_id=obj, phase="pregrasp", target_xyz=_round_vec(pregrasp_xyz, 4), failure_reason="move_pregrasp_failed")
         return
 
     # 2) Move to the grasp pose while ignoring the target cube only.
@@ -1129,11 +1583,11 @@ def pick(obj):
         label=f"pick({obj}) grasp",
         cautious_motion=cautious_motion,
     ):
-        log_event("PICK", "FAILED", object_id=obj, phase="grasp", failure_reason="move_grasp_failed")
+        _log_arm_state("PICK", "FAILED", object_id=obj, phase="grasp", target_xyz=_round_vec(grasp_xyz, 4), failure_reason="move_grasp_failed")
         return
 
     # 3) Close gripper and let contact settle.
-    log_event("PICK", "GRIP_CLOSE", object_id=obj, phase="close_gripper")
+    _log_arm_state("PICK", "GRIP_CLOSE", object_id=obj, phase="close_gripper", target_xyz=_round_vec(grasp_xyz, 4))
     set_grip(grip_target, steps=320 if cautious_motion else 260)
     for _ in range(110 if cautious_motion else 70):
         mujoco.mj_step(model, data)
@@ -1155,18 +1609,18 @@ def pick(obj):
         # closed-loop system replan from the table state.
         drop()
         _held_object_name = None
-        log_event("PICK", "FAILED", object_id=obj, phase="lift", failure_reason="move_lift_failed")
+        _log_arm_state("PICK", "FAILED", object_id=obj, phase="lift", target_xyz=_round_vec(lift_xyz, 4), failure_reason="move_lift_failed")
         return
 
     _check_obstacles_fallen(f"pick({obj})")
     lifted, z = _object_lifted(obj)
     if not lifted:
         print(f"[exec][PICK_RETRY] {obj} not lifted after grasp z={z:.3f}; release and retry")
-        log_event("PICK", "FAILED", object_id=obj, phase="lift_check", failure_reason="object_not_lifted", z=round(z, 4))
+        _log_arm_state("PICK", "FAILED", object_id=obj, phase="lift_check", failure_reason="object_not_lifted", object_z=round(z, 4))
         drop()
         _held_object_name = None
         return
-    log_event("PICK", "OK", object_id=obj)
+    _log_arm_state("PICK", "OK", object_id=obj, object_z=round(z, 4))
 
 
 
@@ -1174,10 +1628,10 @@ def place(x, y, obj=None):
     global _held_object_name, _held_grip_target
 
     print(f"[exec] place({x:.3f}, {y:.3f})")
-    log_event("PLACE", "START", object_id=obj or _held_object_name, target_xyz=[round(float(x), 4), round(float(y), 4), 0.83])
+    _log_arm_state("PLACE", "START", object_id=obj or _held_object_name, target_xyz=[round(float(x), 4), round(float(y), 4), 0.83])
     if _held_object_name is None:
         print("[exec] no cube is currently held")
-        log_event("PLACE", "FAILED", failure_reason="no_object_held")
+        _log_arm_state("PLACE", "FAILED", object_id=obj, failure_reason="no_object_held")
         return
 
     obj = _held_object_name
@@ -1189,6 +1643,15 @@ def place(x, y, obj=None):
     obstacle_distance = _min_obstacle_xy_distance(place_pos)
     approach_clearance = APPROACH_CLEARANCE
     cautious_motion = False
+    _log_arm_state(
+        "PLACE_PRECHECK",
+        "START",
+        object_id=obj,
+        target_xyz=_round_vec(place_pos, 4),
+        obstacle_distance=obstacle_distance if np.isfinite(obstacle_distance) else None,
+        distance_to_target=round(float(np.linalg.norm(np.asarray([x, y]) - np.asarray(_object_xyz(obj)[:2]))), 4) if _object_xyz(obj) else None,
+        approach_clearance=approach_clearance,
+    )
     if obstacle_distance < CAUTIOUS_OBSTACLE_CLEARANCE:
         cautious_motion = True
         approach_clearance += 0.06
@@ -1196,7 +1659,7 @@ def place(x, y, obj=None):
             f"[exec][OBSTACLE_AVOID] place target near obstacle "
             f"distance={obstacle_distance:.3f}m; using cautious high-clearance preplace"
         )
-        log_event(
+        _log_arm_state(
             "OBSTACLE_AVOID",
             "NEAR_CAUTIOUS",
             object_id=obj,
@@ -1208,6 +1671,16 @@ def place(x, y, obj=None):
     preplace_xyz = place_pos + np.array([0.0, 0.0, approach_clearance])
     release_xyz = release_pos + np.array([0.0, 0.0, GRASP_OFFSET])
     retreat_xyz = release_pos + np.array([0.0, 0.0, approach_clearance])
+    _log_arm_state(
+        "PLACE_TARGETS",
+        "SET",
+        object_id=obj,
+        target_xyz=_round_vec(place_pos, 4),
+        preplace_xyz=_round_vec(preplace_xyz, 4),
+        release_xyz=_round_vec(release_xyz, 4),
+        retreat_xyz=_round_vec(retreat_xyz, 4),
+        cautious_motion=cautious_motion,
+    )
 
     # 1) Move above the goal while still holding the cube.
     if not _move_pose_safe(
@@ -1220,7 +1693,7 @@ def place(x, y, obj=None):
     ):
         drop()
         _held_object_name = None
-        log_event("PLACE", "FAILED", object_id=obj, phase="preplace", failure_reason="move_preplace_failed")
+        _log_arm_state("PLACE", "FAILED", object_id=obj, phase="preplace", target_xyz=_round_vec(preplace_xyz, 4), failure_reason="move_preplace_failed")
         return
 
     # 2) Move to the release pose.
@@ -1234,20 +1707,20 @@ def place(x, y, obj=None):
     ):
         drop()
         _held_object_name = None
-        log_event("PLACE", "FAILED", object_id=obj, phase="release", failure_reason="move_release_failed")
+        _log_arm_state("PLACE", "FAILED", object_id=obj, phase="release", target_xyz=_round_vec(release_xyz, 4), failure_reason="move_release_failed")
         return
 
     # 3) Let the arm settle before opening.
-    log_event("PLACE", "SETTLE_BEFORE_OPEN", object_id=obj, steps=120)
+    _log_arm_state("PLACE", "SETTLE_BEFORE_OPEN", object_id=obj, target_xyz=_round_vec(release_xyz, 4), steps=120)
     for _ in range(120):
         mujoco.mj_step(model, data)
         viewer.sync()
 
     print(f"[exec] finger before open: {_finger_pos():.4f}")
-    log_event("PLACE", "GRIP_OPEN", object_id=obj, finger_before=round(_finger_pos(), 4))
+    _log_arm_state("PLACE", "GRIP_OPEN", object_id=obj, target_xyz=_round_vec(release_xyz, 4), finger_before=round(_finger_pos(), 4))
     set_grip(0.04, steps=450)
     print(f"[exec] finger after open:  {_finger_pos():.4f}")
-    log_event("PLACE", "GRIP_OPENED", object_id=obj, finger_after=round(_finger_pos(), 4))
+    _log_arm_state("PLACE", "GRIP_OPENED", object_id=obj, target_xyz=_round_vec(place_pos, 4), finger_after=round(_finger_pos(), 4))
 
     # 4) Let the cube fall and settle.
     for _ in range(160):
@@ -1266,11 +1739,11 @@ def place(x, y, obj=None):
         # Retreat failure after release is not fatal, but we still keep the
         # controller in a safe open state.
         print(f"[exec] retreat failed after place({x:.3f}, {y:.3f})")
-        log_event("PLACE", "RETREAT_FAILED", object_id=obj, failure_reason="retreat_failed_after_release")
+        _log_arm_state("PLACE", "RETREAT_FAILED", object_id=obj, target_xyz=_round_vec(retreat_xyz, 4), failure_reason="retreat_failed_after_release")
 
     _held_object_name = None
     _held_grip_target = 0.015
-    _move_to_grasp_ready(f"after place({x:.3f}, {y:.3f})", grip=0.04)
+    _move_to_grasp_ready(f"after place({x:.3f}, {y:.3f})", grip=0.04, ignored_body_names=[obj])
     _check_obstacles_fallen(f"place({x:.3f}, {y:.3f})")
-    log_event("PLACE", "OK", object_id=obj, target_xyz=[round(float(x), 4), round(float(y), 4), 0.83])
+    _log_arm_state("PLACE", "OK", object_id=obj, target_xyz=[round(float(x), 4), round(float(y), 4), 0.83])
 

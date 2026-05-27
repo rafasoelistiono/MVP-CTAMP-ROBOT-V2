@@ -2,16 +2,17 @@
 mujoco>=2.3.3
 numpy>=2.0,<3
 python-dotenv>=1.0.0
-
-# LLM path used by src/main.py / src/llm_planner.py
-openai>=1.0.0
-
-# Log analysis and README figures
+pin>=2.6.0
+robot_descriptions>=1.0.0
+pytest>=8.0
+ompl>=1.6.0
 pandas>=2.2.0
 matplotlib>=3.8.0
+ipykernel>=6.0
+nbformat>=5.9
 
 # OMPL Python bindings are required for the OMPL-only task scripts and planner.
-# On the WSL environment used for this project this may work:
+# On Linux/WSL this may work:
 #   pip install ompl
 # Verify with:
 #   python -c "from ompl import base, geometric; print('ompl ok')"
