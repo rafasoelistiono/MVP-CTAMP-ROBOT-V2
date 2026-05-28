@@ -1463,6 +1463,7 @@ def pick(obj):
         profile_index = cyl_index
         grip_target = COMPACT_CYLINDER_PICK_GRIP_SEQUENCE[cyl_index]
         grasp_offset = max(COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE[cyl_index], CYLINDER_RETRY_MIN_GRASP_OFFSET)
+        clearance_bonus = PICK_CLEARANCE_BONUS_SEQUENCE[cyl_index]
     _log_arm_state(
         "PICK_PROFILE",
         "SELECT",
