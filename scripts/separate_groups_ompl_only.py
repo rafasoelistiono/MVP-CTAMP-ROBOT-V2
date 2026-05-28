@@ -131,11 +131,16 @@ def _build_separate_groups_targets(scene_file: str):
     occupied = []
     slots = {}
 
+    # Row separation tolerance: displaced targets may not cross into the other row.
+    # Cubes stay at or below cube_row_y + 0.025; circles stay at or above circle_row_y - 0.025.
+    _cube_y_max = cube_row_y + 0.025
+    _circle_y_min = circle_row_y - 0.025
+
     cube_start_x = goal_x - CUBE_SPACING * (len(eligible_cubes) - 1) / 2.0
     for index, obj in enumerate(eligible_cubes):
         radius = obj.get("radius", 0.043)
         base_x = cube_start_x + index * CUBE_SPACING
-        target_xy = _search_safe_target_xy(base_x, cube_row_y, radius, world_state, occupied)
+        target_xy = _search_safe_target_xy(base_x, cube_row_y, radius, world_state, occupied, y_max=_cube_y_max)
         if target_xy is None:
             skipped.append({
                 "object_id": obj["id"],
@@ -157,7 +162,7 @@ def _build_separate_groups_targets(scene_file: str):
     for index, obj in enumerate(eligible_circles):
         radius = obj.get("radius", 0.03)
         base_x = circle_start_x + index * CIRCLE_SPACING
-        target_xy = _search_safe_target_xy(base_x, circle_row_y, radius, world_state, occupied)
+        target_xy = _search_safe_target_xy(base_x, circle_row_y, radius, world_state, occupied, y_min=_circle_y_min)
         if target_xy is None:
             skipped.append({
                 "object_id": obj["id"],
@@ -266,6 +271,8 @@ def main() -> int:
     import feedback
     from exec_trace import flush as flush_trace
     from exec_trace import log_event
+
+    executor.init_hint_cache(log_dir=args.log_dir, scene_filter=scene_key)
 
     if not getattr(executor, "_OMPL_AVAILABLE", False):
         print("[SEPARATE_GROUPS] Executor tidak melihat OMPL planner aktif.")

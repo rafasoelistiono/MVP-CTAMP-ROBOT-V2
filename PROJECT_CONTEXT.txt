@@ -1,0 +1,387 @@
+================================================================================
+PROJECT CONTEXT — MVP CTAMP ROBOT V2
+Written: 2026-05-28
+Purpose: Full handover context for new machine / new conversation
+================================================================================
+
+
+── OVERVIEW ────────────────────────────────────────────────────────────────────
+
+This is a Franka Panda manipulation simulation in MuJoCo. The robot arm plans
+and executes pick-and-place tasks using OMPL (RRTConnect) for joint-space
+motion planning and Pinocchio for IK (with MuJoCo DLS as fallback).
+
+Repository: https://github.com/rafasoelistiono/MVP-CTAMP-ROBOT-V2
+Local path:  ~/RobotResearch/MVP-CTAMP-ROBOT-V2   (WSL Ubuntu 22.04)
+Git user:    azkahaf
+Active branch at time of writing: learning_algo_try
+Main branch: master
+
+
+── ENVIRONMENT ─────────────────────────────────────────────────────────────────
+
+OS:        Windows 11 + WSL Ubuntu 22.04
+Python:    3.10, venv at .venv  (NOT venv, NOT system Python)
+Activate:  source .venv/bin/activate
+Key deps:  mujoco, ompl (Python binding), pinocchio, robot_descriptions,
+           numpy, python-dotenv
+
+OMPL Python binding must be pre-installed in .venv. Verify:
+  python -c "from ompl import base, geometric; print('ompl ok')"
+  python -c "import pinocchio; print('pinocchio ok')"
+
+
+── HOW TO RUN ───────────────────────────────────────────────────────────────────
+
+cd ~/RobotResearch/MVP-CTAMP-ROBOT-V2
+source .venv/bin/activate
+
+# --- align tasks (original validated scripts) ---
+python scripts/align_cubes_ompl_only.py --object group no obs --no-viewer
+python scripts/align_cubes_ompl_only.py --object ungroup no obs --no-viewer
+python scripts/align_cubes_ompl_only.py --object group obs --no-viewer
+python scripts/align_cubes_ompl_only.py --object ungroup obs --no-viewer
+
+python scripts/align_tabung_ompl_only.py --object group no obs --no-viewer
+python scripts/align_tabung_ompl_only.py --object ungroup no obs --no-viewer
+python scripts/align_tabung_ompl_only.py --object group obs --no-viewer
+python scripts/align_tabung_ompl_only.py --object ungroup obs --no-viewer
+
+# --- separate_groups task (new script, added in this session) ---
+python scripts/separate_groups_ompl_only.py --object group no obs --no-viewer
+python scripts/separate_groups_ompl_only.py --object ungroup no obs --no-viewer
+python scripts/separate_groups_ompl_only.py --object group obs --no-viewer
+python scripts/separate_groups_ompl_only.py --object ungroup obs --no-viewer
+
+# --- tests ---
+python -m pytest -q
+
+
+── VALIDATED STATUS (as of 2026-05-27, post Refactor 3) ────────────────────────
+
+All 8 align variants: 4/4 success each.
+
+  align_cubes_group_no_obs       4/4   log: 20260527_221340.csv
+  align_cubes_ungroup_no_obs     4/4   log: 20260527_205745.csv
+  align_tabung_group_no_obs      4/4   log: 20260527_204857.csv
+  align_tabung_ungroup_no_obs    4/4   log: 20260527_205443.csv
+  align_cubes_group_obs          4/4   log: 20260527_221340.csv
+  align_tabung_group_obs         4/4   log: 20260527_221940.csv
+
+separate_groups: first run on 2026-05-28 achieved 8/8 but took 22.5 minutes
+due to Pinocchio failures (see issues section below).
+
+
+── FILE STRUCTURE ───────────────────────────────────────────────────────────────
+
+src/
+  executor.py        main action library (pick, place, OMPL planning, IK)
+  config.py          AppConfig dataclass, reads .env
+  exec_trace.py      event logging to CSV + console
+  feedback.py        check_pick / check_place feedback functions
+  hint_cache.py      [NEW 2026-05-28] adaptive heuristic learning from logs
+  ik_diagnostics.py  IK attempt classification, ranking, failure taxonomy
+  collision_policy.py collision checking policy for OMPL state validity
+  ompl_planner.py    OMPL planner wrapper (RRTConnect default)
+
+scripts/
+  align_cubes_ompl_only.py   pick-and-place cubes to aligned row
+  align_tabung_ompl_only.py  pick-and-place cylinders to aligned row
+  separate_groups_ompl_only.py  [NEW 2026-05-28] separate cubes (row-) and
+                                 circles (row+) in a single run
+  ctamp_task_utils.py        shared utilities: scene variants, CSV writing
+
+models/
+  panda*.xml         MuJoCo scene files per variant
+
+logs/
+  <task>_<scene>_<timestamp>.csv          summary CSV per run
+  <task>_<scene>_<timestamp>_events.csv   detailed event log per run
+
+docs/
+  hintcache_plan.txt    design document for the HintCache feature
+  *.svg / *.csv         visualizations and metrics from past refactors
+  ompl_log_analysis.ipynb  analysis notebook
+
+
+── PIPELINE ─────────────────────────────────────────────────────────────────────
+
+task script
+  → env vars + scene variant setup
+  → import executor (loads MuJoCo model, initializes IK backend, warmup)
+  → init_hint_cache() (NEW: load adaptive hints from past logs)
+  → compute targets + move order
+  → for each object:
+      pick(obj)
+        → hint context setup (reach_dist, obstacle_dist, obj_class)
+        → move to GRASP_READY
+        → profile selection (grip, grasp_offset, clearance_bonus)
+        → profile hint override (NEW: use best profile from past logs)
+        → OMPL pregrasp → grasp → lift
+      check_pick()
+      place(obj, target)
+        → OMPL preplace → release → retreat
+      check_place()
+  → write summary CSV
+
+
+── KEY EXECUTOR.PY CONSTANTS ────────────────────────────────────────────────────
+
+PICK_GRIP_SEQUENCE              = (0.015, 0.011, 0.008)
+PICK_GRASP_OFFSET_SEQUENCE      = (0.10,  0.10,  0.10)
+PICK_CLEARANCE_BONUS_SEQUENCE   = (0.0,   0.035, 0.06)
+
+COMPACT_CYLINDER_PICK_GRIP_SEQUENCE         = (0.014, 0.012, 0.010)
+COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE = (0.105, 0.095, 0.085)
+CYLINDER_RETRY_MIN_GRASP_OFFSET  = 0.095  (env: CYLINDER_RETRY_MIN_GRASP_OFFSET)
+
+Cylinders always start at cyl_index = profile_index + 1 (skip profile 0).
+Profile 1 (grasp_offset=0.095, clearance_bonus=0.035) is the proven reliable
+starting profile for cylinders.
+
+FAR_PICK_XY_DISTANCE = 0.74   objects beyond this get +0.02 grasp_offset boost
+BASE_XY = [-0.4, 0.0]         arm base position in MuJoCo world frame
+
+Obstacle thresholds (env-overridable):
+  MIN_PICK_OBSTACLE_CLEARANCE  = 0.18  (0.12 for obs scenes)
+  CAUTIOUS_OBSTACLE_CLEARANCE  = 0.24  (0.28 for obs scenes)
+  TABLE_FINGER_CONTACT_TOLERANCE = 0.005
+
+IK error limits:
+  IK_PLAN_POS_ERR_LIMIT     = 0.020  (env: IK_PLAN_POS_ERR_LIMIT)
+  IK_PREGRASP_POS_ERR_LIMIT = 0.030  (env: IK_PREGRASP_POS_ERR_LIMIT)
+  IK_PLAN_ORI_ERR_LIMIT     = 0.35
+  IK_PREGRASP_ORI_ERR_LIMIT = 0.50
+
+
+── IK BACKEND ───────────────────────────────────────────────────────────────────
+
+Default: IK_BACKEND=auto → tries Pinocchio first, falls back to MuJoCo DLS.
+
+Pinocchio IK:
+- Runs in Panda base frame (converted from MuJoCo world frame via
+  _pinocchio_base_translation() which reads link0.pos from the model).
+- FK validation: result is validated with MuJoCo FK after Pinocchio solve.
+  If MuJoCo FK error > pos_limit, falls back to DLS.
+- When Pinocchio FK validation fails, an IK_SOLVE BACKEND_FALLBACK event
+  is logged with failure_reason=pinocchio_fk_validation_failed.
+
+MuJoCo DLS:
+- Damped Least Squares IK solver built into executor.py.
+- 800 iterations default, 0.008m typical convergence.
+- Reliable but slower than Pinocchio when Pinocchio works.
+
+Known issue: For ungroup_obs scene (2026-05-28), Pinocchio FK validation
+failed on 68% of all IK attempts (631/929), causing 22.5-minute runtime.
+Root cause: frame offset mismatch between Pinocchio model and this scene's
+robot base position. HintCache (see below) detects and skips Pinocchio
+automatically from the second run onwards.
+
+
+── SEPARATE_GROUPS SCRIPT ───────────────────────────────────────────────────────
+
+New task: move cubes to cube row (goal_y - 0.065) and circles to circle row
+(goal_y + 0.065) in a single run.
+
+Goal layout (goal_y ≈ -0.060):
+  cube   row: y ≈ -0.125   (4 cube target slots, spacing 0.11m)
+  circle row: y ≈  0.005   (4 circle target slots, spacing 0.105m)
+
+Object sort order: easiest first (CLEAR > NEAR, closer reach first), then
+interleaved so both groups advance together.
+
+Target allocation: _build_separate_groups_targets() in the script.
+Uses _search_safe_target_xy() (from align_cubes_ompl_only.py, imported).
+
+IMPORTANT: y_min/y_max row bounds are now passed to prevent displaced targets
+from crossing into the other group's row:
+  cube targets:   y_max = cube_row_y + 0.025
+  circle targets: y_min = circle_row_y - 0.025
+
+Previously circle4 was displaced to y=-0.030 (crossing toward cube row) due to
+a full circle row. With y_min bound this now correctly fails with
+no_safe_aligned_target_found instead of placing in the wrong row.
+
+
+── HINTCACHE FEATURE (implemented 2026-05-28) ──────────────────────────────────
+
+File: src/hint_cache.py
+
+Purpose: reads past *_events.csv logs at run startup, computes statistics per
+workspace bucket, and gives three adaptive hints to executor.py.
+
+HINT 1 — preferred_backend():
+  Counts IK_SOLVE BACKEND_FALLBACK (pinocchio_fk_validation_failed) events
+  vs total IK_CANDIDATE events. If rate >= HINT_PINOCCHIO_SKIP_RATE (default
+  0.70), returns "mujoco_dls" to skip Pinocchio for the entire run.
+
+HINT 2 — pos_err_tolerance():
+  For each (reach_bucket, obstacle_bucket), finds IK_CANDIDATE REJECT events
+  with ik_error_above_limit. If many are "near misses" (pos_err just above
+  pos_limit), returns a widened threshold so those candidates are accepted.
+
+HINT 3 — preferred_grasp_profile():
+  Pairs PICK_PROFILE SELECT events with CHECK_PICK outcomes per
+  (obj_class, reach_bucket). Returns the profile index with highest success
+  rate to use on the first pick attempt.
+
+Workspace buckets:
+  reach:    near (<0.5m), mid (0.5–0.7m), far (0.7–0.85m), borderline (>0.85m)
+  obstacle: clear (>0.28m), near (0.12–0.28m), too_close (<0.12m)
+
+Requires MIN_SAMPLES (default 5) data points per bucket before firing.
+Cold-start safe: returns None when insufficient data → executor uses defaults.
+
+Integration in executor.py:
+  - init_hint_cache(log_dir, scene_filter) — call after executor import
+  - _hint_context dict — set by pick() with reach_dist, obstacle_dist, obj_class
+  - _solve_ik_to() — checks preferred_backend() at top of Pinocchio branch
+  - _ranked_ik_goals() — widens pos_limit if pos_err_tolerance() returns a hint
+  - pick() — reads cube_pos early, sets _hint_context, applies profile hint
+
+All tunable thresholds have env var overrides:
+  HINT_MIN_SAMPLES           (default 5)
+  HINT_PINOCCHIO_SKIP_RATE   (default 0.70)
+  HINT_NEAR_MISS_RATE        (default 0.40)
+  HINT_NEAR_MISS_FACTOR      (default 0.50)
+  HINT_TOLERANCE_HEADROOM    (default 1.10)
+  HINT_MAX_TOLERANCE_FACTOR  (default 1.60)
+
+The cache logs what it learned at run start:
+  grep "HINT_CACHE" logs/<run>_events.csv
+
+
+── LOG SCHEMA ───────────────────────────────────────────────────────────────────
+
+Every run writes two files:
+  logs/<task>_<scene>_<timestamp>.csv           summary (1 row)
+  logs/<task>_<scene>_<timestamp>_events.csv    detailed event stream
+
+Key event stages for debugging:
+  TASK_CONTEXT / TASK_ROUND    run setup and round info
+  HINT_CACHE                   what HintCache learned (NEW)
+  OBSTACLE_PROXIMITY           NEAR_CAUTIOUS or FAILED precheck
+  OBSTACLE_AVOID               NEAR_CAUTIOUS or CLEAR per object
+  PICK_PROFILE SELECT          which grip profile was chosen
+  PICK_PROFILE FAR_PREGRASP    far-reach adjustment applied
+  PICK_PRECHECK                object pose validation
+  IK_SOLVE BACKEND_FALLBACK    Pinocchio failed FK, using DLS
+  IK_CANDIDATE OK / REJECT     per IK candidate result
+  OMPL_PLAN OK / ERROR         OMPL planning result + waypoints
+  TRAJECTORY_EXEC              trajectory execution start
+  TRAJECTORY_WAYPOINT          execution progress
+  CHECK_PICK OK / FAILED       did the object get lifted
+  CHECK_PLACE OK / FAILED      did the object land correctly
+
+Failure taxonomy:
+  ik_error_above_limit         pos_err > pos_limit after IK
+  ik_orientation_error_above_limit
+  ik_unreachable               no valid IK candidate found
+  ik_joint_limit_invalid
+  ik_goal_collision_invalid
+  ompl_timeout
+  ompl_no_path_found
+  execution_failed
+  object_near_obstacle_safety_skip
+  object_too_close_to_obstacle
+  object_outside_conservative_reach
+
+
+── OBSTACLE SCENE SPECIFICS ─────────────────────────────────────────────────────
+
+group_obs obstacle positions (validated in Refactor 3):
+  obstacle1 = (-0.18, -0.30)
+  obstacle2 = ( 0.42,  0.18)
+
+For obs scenes, task scripts override:
+  MIN_PICK_OBSTACLE_CLEARANCE  = 0.12
+  CAUTIOUS_OBSTACLE_CLEARANCE  = 0.28
+  MAX_VALID_IK_CANDIDATES      = 8
+  OMPL_TIME_LIMIT              = 8.0
+  TABLE_FINGER_CONTACT_TOLERANCE = 0.005
+
+
+── REFACTOR HISTORY ─────────────────────────────────────────────────────────────
+
+Refactor 0 (before): IK MuJoCo DLS legacy, no Pinocchio, no event logs.
+  Cubes: 3/4, Tabung: 2/4.
+
+Refactor 1: Added Pinocchio IK, MuJoCo FK validation, failure taxonomy, CSV
+  event logging. Cubes dropped to 0/4 — discovered frame mismatch bug where
+  Pinocchio was getting world-frame targets instead of base-frame targets.
+
+Refactor 2: Fixed Pinocchio frame conversion (world → Panda base frame via
+  _pinocchio_base_translation()). Added candidate generator with XY offsets,
+  radial variants for far objects, ignore-list for grasp/release state validity,
+  rank_ik_attempts scoring. All no-obstacle variants: 4/4.
+
+Refactor 3: Fixed group_obs variants (were 1/4). Separated NEAR from TOO_CLOSE
+  objects (NEAR gets cautious execution, not auto-skip). Validated obstacle
+  positions. Added TABLE_FINGER_CONTACT_TOLERANCE. Fixed place→repick flow.
+  All 8 variants: 4/4.
+
+Learning algo (2026-05-28, branch: learning_algo_try):
+  Added HintCache adaptive learning. Added separate_groups task script.
+  Fixed circle target row displacement bug. All 8 align variants still 4/4.
+  separate_groups: 8/8 first run (22.5 min due to Pinocchio issue — HintCache
+  will reduce this to ~8 min from the second run onwards).
+
+
+── KNOWN ISSUES / OPEN ITEMS ────────────────────────────────────────────────────
+
+1. Pinocchio frame regression for ungroup_obs:
+   For the ungroup_obs scene specifically, Pinocchio FK validation fails 68%
+   of the time (pos_err 0.38–0.85m). Root cause not yet fully diagnosed —
+   likely the robot base position in panda_ungroup_obs.xml differs from what
+   _pinocchio_base_translation() reads. HintCache mitigates this from run 2+
+   but the root cause should eventually be fixed in _pinocchio_ik_solve_to().
+
+2. circle4 in ungroup_obs is hard to pick:
+   At position [0.34, 0.34] (reach ~0.81m, obstacle distance ~0.179m), DLS
+   converges to pos_err ~0.046–0.061 which is above the 0.03 pregrasp limit.
+   HintCache widens the tolerance for the (far, near) bucket after seeing this
+   pattern. Still takes 3 pick attempts on the first run without history.
+
+3. separate_groups ungroup_obs: runtime 22.5 min on first run.
+   Expected ~8 min. Will improve automatically from second run via HintCache.
+
+4. HintCache profile hint needs more data:
+   Profile hints require MIN_SAMPLES (5) CHECK_PICK events per bucket. Most
+   buckets will need 2–3 full runs before profile hints become active.
+
+
+── WSL / DISK ISSUES SEEN ───────────────────────────────────────────────────────
+
+On 2026-05-28, during a run the WSL filesystem went read-only mid-execution:
+  [Errno 5] Input/output error → OSError: [Errno 30] Read-only file system
+  → Bus error (core dumped)
+
+This is a WSL virtual disk corruption event, not a code bug. Fix:
+  1. From Windows PowerShell: wsl --shutdown
+  2. Reopen WSL terminal (auto-runs e2fsck on the .vhdx)
+  3. Verify: df -h
+
+If basic commands still fail after restart (tail, dmesg give I/O errors),
+the .vhdx needs manual e2fsck. Check disk space first: df -h
+
+
+── TUNING REFERENCE ─────────────────────────────────────────────────────────────
+
+For HintCache threshold tuning (set before running, read docs/hintcache_plan.txt):
+
+  Problem                              Fix
+  ─────────────────────────────────    ──────────────────────────────────────
+  Pinocchio not skipped (rate ~0.68)   Lower HINT_PINOCCHIO_SKIP_RATE to 0.60
+  circle4 still burning 100+ rejects   Lower HINT_NEAR_MISS_RATE to 0.30
+  pos_err near-misses not captured     Raise HINT_NEAR_MISS_FACTOR to 0.80
+  Hints firing too early (noisy data)  Raise HINT_MIN_SAMPLES to 10
+  Widened tolerance too aggressive     Lower HINT_MAX_TOLERANCE_FACTOR to 1.40
+
+For IK performance:
+  MAX_VALID_IK_CANDIDATES     controls how many good candidates are enough
+  MAX_IK_ATTEMPTS_PER_SEGMENT hard cap on total attempts per phase
+  OMPL_TIME_LIMIT             seconds per OMPL planning call
+
+================================================================================
+END OF CONTEXT
+================================================================================

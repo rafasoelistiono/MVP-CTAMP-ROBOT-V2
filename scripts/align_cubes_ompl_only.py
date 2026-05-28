@@ -115,10 +115,18 @@ def _target_xy_ok(x: float, y: float, radius: float, world_state, occupied=()) -
     return True
 
 
-def _search_safe_target_xy(base_x: float, base_y: float, radius: float, world_state, occupied=()):
+def _search_safe_target_xy(
+    base_x: float,
+    base_y: float,
+    radius: float,
+    world_state,
+    occupied=(),
+    y_min: float = None,
+    y_max: float = None,
+):
     table = world_state["table"]
     x_min, x_max = table["x_range"]
-    y_min, y_max = table["y_range"]
+    y_min_table, y_max_table = table["y_range"]
     candidates = []
     for ring in range(0, 7):
         for dx in range(-ring, ring + 1):
@@ -126,7 +134,7 @@ def _search_safe_target_xy(base_x: float, base_y: float, radius: float, world_st
                 if ring and abs(dx) != ring and abs(dy) != ring:
                     continue
                 x = min(max(base_x + dx * 0.035, x_min + radius), x_max - radius)
-                y = min(max(base_y + dy * 0.035, y_min + radius), y_max - radius)
+                y = min(max(base_y + dy * 0.035, y_min_table + radius), y_max_table - radius)
                 candidates.append((x, y))
 
     seen = set()
@@ -139,6 +147,10 @@ def _search_safe_target_xy(base_x: float, base_y: float, radius: float, world_st
 
     unique.sort(key=lambda xy: abs(xy[1] - base_y) * 3.0 + abs(xy[0] - base_x))
     for x, y in unique:
+        if y_min is not None and y < y_min:
+            continue
+        if y_max is not None and y > y_max:
+            continue
         if _target_xy_ok(x, y, radius, world_state, occupied):
             return x, y
     return None
