@@ -114,6 +114,7 @@ def main() -> int:
     parser.add_argument("--object", nargs="+", default=["group", "no", "obs"], help="Scene: group no obs, ungroup no obs, group obs, ungroup obs.")
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--no-viewer", action="store_true")
+    parser.add_argument("--no-hint-cache", action="store_true", help="Disable HintCache adaptive learning (use fixed defaults).")
     parser.add_argument("--place-retries", type=int, default=2, help=argparse.SUPPRESS)
     parser.add_argument("--settle-after-place", type=int, default=300, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -172,6 +173,11 @@ def main() -> int:
     if not getattr(executor, "_OMPL_AVAILABLE", False):
         print("[ALIGN_TABUNG] Executor tidak melihat OMPL planner aktif.")
         return 2
+
+    if args.no_hint_cache:
+        print("[ALIGN_TABUNG] HintCache disabled (--no-hint-cache).")
+    else:
+        executor.init_hint_cache(log_dir=args.log_dir, scene_filter=scene_key)
 
     log_event(
         "TASK_CONTEXT",
