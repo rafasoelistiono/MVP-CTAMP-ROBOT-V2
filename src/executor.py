@@ -1457,10 +1457,12 @@ def pick(obj):
     clearance_bonus = PICK_CLEARANCE_BONUS_SEQUENCE[profile_index]
     is_circle = obj.startswith("circle")
     if is_circle:
-        grip_target = COMPACT_CYLINDER_PICK_GRIP_SEQUENCE[profile_index]
-        grasp_offset = COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE[profile_index]
-        if profile_index > 0:
-            grasp_offset = max(grasp_offset, CYLINDER_RETRY_MIN_GRASP_OFFSET)
+        # Cylinders skip profile 0 (grasp_offset=0.105 overshoots the cylinder body).
+        # Start at profile 1 (grasp_offset=0.095) which is already proven reliable.
+        cyl_index = min(profile_index + 1, len(COMPACT_CYLINDER_PICK_GRIP_SEQUENCE) - 1)
+        profile_index = cyl_index
+        grip_target = COMPACT_CYLINDER_PICK_GRIP_SEQUENCE[cyl_index]
+        grasp_offset = max(COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE[cyl_index], CYLINDER_RETRY_MIN_GRASP_OFFSET)
     _log_arm_state(
         "PICK_PROFILE",
         "SELECT",
