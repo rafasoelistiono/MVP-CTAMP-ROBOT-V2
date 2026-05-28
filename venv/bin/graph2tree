@@ -1,3 +1,0 @@
-#!/home/azkahaf/RobotResearch/MVP-CTAMP-ROBOT-V2/venv/bin/python3
-from cmeel.run import cmeel_run
-cmeel_run()

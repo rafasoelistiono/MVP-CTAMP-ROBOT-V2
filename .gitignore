@@ -6,3 +6,4 @@ __pycache__/
 logs/
 MUJOCO_LOG.TXT
 models/generated/
+venv/

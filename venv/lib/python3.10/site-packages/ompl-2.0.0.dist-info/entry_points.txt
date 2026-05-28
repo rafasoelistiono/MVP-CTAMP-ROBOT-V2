@@ -1,3 +1,0 @@
-[console_scripts]
-ompl_benchmark_statistics = ompl.ompl_benchmark_statistics:main
-
