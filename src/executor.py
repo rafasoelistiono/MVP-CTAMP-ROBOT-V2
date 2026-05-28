@@ -117,6 +117,9 @@ _PINOCCHIO_DATA = None
 _PINOCCHIO_FRAME_ID = None
 _LAST_SUCCESSFUL_SEED: Optional[np.ndarray] = None
 
+_hint_cache = None          # set by init_hint_cache()
+_hint_context: dict = {}    # set by pick()/place() before each IK call sequence
+
 _BASE_ROBOT_BODY_NAMES = (
     "link0",
     "link1",
@@ -705,6 +708,17 @@ def _pinocchio_base_translation() -> np.ndarray:
     return np.asarray(model.body(f"{prefix}link0").pos[:3], dtype=float)
 
 
+def init_hint_cache(log_dir: str = "logs", scene_filter: Optional[str] = None) -> None:
+    """Load HintCache from past event logs. Call once after importing executor."""
+    global _hint_cache
+    try:
+        from hint_cache import HintCache
+        _hint_cache = HintCache(log_dir=log_dir, scene_filter=scene_filter)
+        log_event("HINT_CACHE", "LOADED", **_hint_cache.summary())
+    except Exception as exc:
+        log_event("HINT_CACHE", "FAILED", failure_reason=str(exc))
+
+
 def _solve_ik_to(
     target_xyz,
     null_ref=None,
@@ -714,6 +728,11 @@ def _solve_ik_to(
     ori_limit: Optional[float] = None,
 ):
     if _IK_BACKEND_NAME == "pinocchio":
+        if _hint_cache is not None and _hint_cache.preferred_backend(
+            reach_dist=_hint_context.get("reach_dist", 0.0),
+            obstacle_dist=_hint_context.get("obstacle_dist", float("inf")),
+        ) == "mujoco_dls":
+            return _ik_solve_to(target_xyz, null_ref=null_ref, q_seed=q_seed, steps=steps)
         try:
             seed = q_seed if q_seed is not None else null_ref
             pin_q, pin_info = _pinocchio_ik_solve_to(target_xyz, q_seed=seed, steps=180)
@@ -867,6 +886,13 @@ def _ranked_ik_goals(
     planner = _get_ompl_planner()
     pos_limit = _ik_pos_limit_for_label(label)
     ori_limit = _ik_ori_limit_for_label(label)
+    if _hint_cache is not None:
+        _hint_tol = _hint_cache.pos_err_tolerance(
+            reach_dist=_hint_context.get("reach_dist", 0.0),
+            obstacle_dist=_hint_context.get("obstacle_dist", float("inf")),
+        )
+        if _hint_tol is not None and _hint_tol > pos_limit:
+            pos_limit = _hint_tol
     attempts: list[IKAttemptResult] = []
 
     for candidate_idx, xyz in enumerate(_target_xyz_candidates(target_xyz, label)):
@@ -1444,6 +1470,14 @@ def pick(obj):
         _log_arm_state("PICK", "FAILED", object_id=obj, failure_reason="unknown_object")
         return
 
+    # Read approximate object position early for hint context (pre-settle).
+    cube_id = name_to_cube[obj]
+    mujoco.mj_forward(model, data)
+    _hint_cube_pos = data.xpos[cube_id].copy()
+    _hint_context["reach_dist"] = float(np.linalg.norm(_hint_cube_pos[:2] - BASE_XY))
+    _hint_context["obstacle_dist"] = _min_obstacle_xy_distance(_hint_cube_pos)
+    _hint_context["obj_class"] = "circle" if obj.startswith("circle") else "cube"
+
     if not _move_to_grasp_ready(f"before pick({obj})", grip=0.04):
         _log_arm_state("PICK", "FAILED", object_id=obj, phase="transit", failure_reason="move_to_grasp_ready_failed")
         return
@@ -1464,6 +1498,27 @@ def pick(obj):
         grip_target = COMPACT_CYLINDER_PICK_GRIP_SEQUENCE[cyl_index]
         grasp_offset = max(COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE[cyl_index], CYLINDER_RETRY_MIN_GRASP_OFFSET)
         clearance_bonus = PICK_CLEARANCE_BONUS_SEQUENCE[cyl_index]
+
+    # Apply profile hint on the first pick attempt for this object.
+    if _hint_cache is not None and call_count == 0:
+        _hint_pi = _hint_cache.preferred_grasp_profile(
+            obj_class="circle" if is_circle else "cube",
+            reach_dist=_hint_context.get("reach_dist", 0.5),
+        )
+        if _hint_pi is not None and _hint_pi != profile_index:
+            if is_circle:
+                _ci = min(_hint_pi, len(COMPACT_CYLINDER_PICK_GRIP_SEQUENCE) - 1)
+                profile_index = _ci
+                grip_target = COMPACT_CYLINDER_PICK_GRIP_SEQUENCE[_ci]
+                grasp_offset = max(COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE[_ci], CYLINDER_RETRY_MIN_GRASP_OFFSET)
+                clearance_bonus = PICK_CLEARANCE_BONUS_SEQUENCE[_ci]
+            else:
+                _pi = min(_hint_pi, len(PICK_GRIP_SEQUENCE) - 1)
+                profile_index = _pi
+                grip_target = PICK_GRIP_SEQUENCE[_pi]
+                grasp_offset = PICK_GRASP_OFFSET_SEQUENCE[_pi]
+                clearance_bonus = PICK_CLEARANCE_BONUS_SEQUENCE[_pi]
+
     _log_arm_state(
         "PICK_PROFILE",
         "SELECT",
@@ -1473,8 +1528,6 @@ def pick(obj):
         grasp_offset=grasp_offset,
         clearance_bonus=clearance_bonus,
     )
-
-    cube_id = name_to_cube[obj]
 
     # Let the system settle before planning a new motion.
     _step_sim(80, grip=0.04)

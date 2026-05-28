@@ -114,6 +114,7 @@ def main() -> int:
     parser.add_argument("--object", nargs="+", default=["group", "no", "obs"], help="Scene: group no obs, ungroup no obs, group obs, ungroup obs.")
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--no-viewer", action="store_true")
+    parser.add_argument("--no-hint-cache", action="store_true", help="Disable HintCache adaptive learning (use fixed defaults).")
     parser.add_argument("--place-retries", type=int, default=2, help=argparse.SUPPRESS)
     parser.add_argument("--settle-after-place", type=int, default=300, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -173,6 +174,11 @@ def main() -> int:
         print("[ALIGN_TABUNG] Executor tidak melihat OMPL planner aktif.")
         return 2
 
+    if args.no_hint_cache:
+        print("[ALIGN_TABUNG] HintCache disabled (--no-hint-cache).")
+    else:
+        executor.init_hint_cache(log_dir=args.log_dir, scene_filter=scene_key)
+
     log_event(
         "TASK_CONTEXT",
         "START",
@@ -199,6 +205,8 @@ def main() -> int:
             obstacle_distance=item.get("obstacle_distance"),
             reach_distance=item.get("reach_distance"),
         )
+
+    placed_targets = {}  # {object_id: (target_x, target_y)} for sweep monitoring
 
     max_pick_attempts = 3
     pick_attempts = {object_id: 0 for object_id in move_order}
@@ -319,6 +327,34 @@ def main() -> int:
                     })
                 continue
 
+            # Sweep already-placed objects for arm-induced disturbances.
+            disturbed = feedback.check_placed_objects(
+                executor.model, executor.data, executor.name_to_cube, placed_targets
+            )
+            for d in disturbed:
+                did = d["object_id"]
+                print(f"[{index:02d}] PLACED_OBJECT_DISTURBED object={did} reason={d['reason']} actual={d['actual_pos']}")
+                log_event(
+                    "PLACED_OBJECT_DISTURBED",
+                    "DETECTED",
+                    object_id=did,
+                    phase="pick",
+                    actual_xyz=d["actual_pos"],
+                    failure_reason=d["reason"],
+                    triggered_by=object_id,
+                )
+                moved.remove(did)
+                placed_targets.pop(did, None)
+                if pick_attempts.get(did, 0) < max_pick_attempts:
+                    pending.insert(0, did)
+                else:
+                    failed.append({
+                        "object_id": did,
+                        "stage": "place",
+                        "failure_reason": d["reason"],
+                        "actual": d["actual_pos"],
+                    })
+
             place_ok = False
             actual = None
             for retry in range(args.place_retries + 1):
@@ -368,6 +404,7 @@ def main() -> int:
 
             if place_ok:
                 moved.append(object_id)
+                placed_targets[object_id] = (x, y)
                 _settle(executor, args.settle_after_place)
             else:
                 already_failed = any(item.get("object_id") == object_id and item.get("stage") == "place" for item in failed)

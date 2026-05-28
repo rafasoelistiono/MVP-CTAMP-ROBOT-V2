@@ -115,10 +115,18 @@ def _target_xy_ok(x: float, y: float, radius: float, world_state, occupied=()) -
     return True
 
 
-def _search_safe_target_xy(base_x: float, base_y: float, radius: float, world_state, occupied=()):
+def _search_safe_target_xy(
+    base_x: float,
+    base_y: float,
+    radius: float,
+    world_state,
+    occupied=(),
+    y_min: float = None,
+    y_max: float = None,
+):
     table = world_state["table"]
     x_min, x_max = table["x_range"]
-    y_min, y_max = table["y_range"]
+    y_min_table, y_max_table = table["y_range"]
     candidates = []
     for ring in range(0, 7):
         for dx in range(-ring, ring + 1):
@@ -126,7 +134,7 @@ def _search_safe_target_xy(base_x: float, base_y: float, radius: float, world_st
                 if ring and abs(dx) != ring and abs(dy) != ring:
                     continue
                 x = min(max(base_x + dx * 0.035, x_min + radius), x_max - radius)
-                y = min(max(base_y + dy * 0.035, y_min + radius), y_max - radius)
+                y = min(max(base_y + dy * 0.035, y_min_table + radius), y_max_table - radius)
                 candidates.append((x, y))
 
     seen = set()
@@ -139,6 +147,10 @@ def _search_safe_target_xy(base_x: float, base_y: float, radius: float, world_st
 
     unique.sort(key=lambda xy: abs(xy[1] - base_y) * 3.0 + abs(xy[0] - base_x))
     for x, y in unique:
+        if y_min is not None and y < y_min:
+            continue
+        if y_max is not None and y > y_max:
+            continue
         if _target_xy_ok(x, y, radius, world_state, occupied):
             return x, y
     return None
@@ -351,6 +363,7 @@ def main() -> int:
     parser.add_argument("--object", nargs="+", default=["group", "no", "obs"], help="Scene: group no obs, ungroup no obs, group obs, ungroup obs.")
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--no-viewer", action="store_true")
+    parser.add_argument("--no-hint-cache", action="store_true", help="Disable HintCache adaptive learning (use fixed defaults).")
     parser.add_argument("--place-retries", type=int, default=2, help=argparse.SUPPRESS)
     parser.add_argument("--settle-after-place", type=int, default=300, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -418,6 +431,11 @@ def main() -> int:
         print("[ALIGN_CUBES] Executor tidak melihat OMPL planner aktif.")
         return 2
 
+    if args.no_hint_cache:
+        print("[ALIGN_CUBES] HintCache disabled (--no-hint-cache).")
+    else:
+        executor.init_hint_cache(log_dir=args.log_dir, scene_filter=scene_key)
+
     log_event(
         "TASK_CONTEXT",
         "START",
@@ -444,6 +462,8 @@ def main() -> int:
             obstacle_distance=item.get("obstacle_distance"),
             reach_distance=item.get("reach_distance"),
         )
+    placed_targets = {}  # {object_id: (target_x, target_y)} for sweep monitoring
+
     max_pick_attempts = 3
     pick_attempts = {object_id: 0 for object_id in move_order}
     pending = list(move_order)
@@ -576,6 +596,34 @@ def main() -> int:
                     })
                 continue
 
+            # Sweep already-placed objects for arm-induced disturbances.
+            disturbed = feedback.check_placed_objects(
+                executor.model, executor.data, executor.name_to_cube, placed_targets
+            )
+            for d in disturbed:
+                did = d["object_id"]
+                print(f"[{index:02d}] PLACED_OBJECT_DISTURBED object={did} reason={d['reason']} actual={d['actual_pos']}")
+                log_event(
+                    "PLACED_OBJECT_DISTURBED",
+                    "DETECTED",
+                    object_id=did,
+                    phase="pick",
+                    actual_xyz=d["actual_pos"],
+                    failure_reason=d["reason"],
+                    triggered_by=object_id,
+                )
+                moved.remove(did)
+                placed_targets.pop(did, None)
+                if pick_attempts.get(did, 0) < max_pick_attempts:
+                    pending.insert(0, did)
+                else:
+                    failed.append({
+                        "object_id": did,
+                        "stage": "place",
+                        "failure_reason": d["reason"],
+                        "actual": d["actual_pos"],
+                    })
+
             place_ok = False
             actual = None
             for retry in range(args.place_retries + 1):
@@ -625,6 +673,7 @@ def main() -> int:
 
             if place_ok:
                 moved.append(object_id)
+                placed_targets[object_id] = (x, y)
                 _settle(executor, args.settle_after_place)
             else:
                 already_failed = any(item.get("object_id") == object_id and item.get("stage") == "place" for item in failed)

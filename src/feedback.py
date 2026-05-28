@@ -26,6 +26,31 @@ def check_pick(model, data, cube_id):
     return z > HELD_Z_THRESHOLD, round(z, 3)
 
 
+def check_placed_objects(model, data, name_to_cube, placed_targets):
+    """
+    Sweep all already-placed objects and return a list of disturbed ones.
+
+    placed_targets: dict of {object_id: (target_x, target_y)} for every
+                    object that previously passed check_place.
+
+    Returns list of dicts: {object_id, actual_pos, reason}
+    """
+    mujoco.mj_forward(model, data)
+    disturbed = []
+    for oid, (tx, ty) in placed_targets.items():
+        cube_id = name_to_cube.get(oid)
+        if cube_id is None:
+            continue
+        pos = data.xpos[cube_id]
+        z = float(pos[2])
+        actual = [round(float(pos[0]), 3), round(float(pos[1]), 3), round(z, 3)]
+        if z >= PLACED_Z_THRESHOLD:
+            disturbed.append({"object_id": oid, "actual_pos": actual, "reason": "object_lifted_off_table"})
+        elif float(np.linalg.norm(pos[:2] - np.array([tx, ty]))) >= PLACE_TOLERANCE_M:
+            disturbed.append({"object_id": oid, "actual_pos": actual, "reason": "object_displaced_from_target"})
+    return disturbed
+
+
 def check_place(model, data, cube_id, target_x, target_y):
     """
     Call immediately after executor.place() returns.

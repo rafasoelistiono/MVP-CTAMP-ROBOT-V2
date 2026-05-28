@@ -442,3 +442,65 @@ Hasil terakhir:
 
 Skip di Windows terjadi karena OMPL/Pinocchio tidak tersedia di interpreter
 aktif Windows, sedangkan WSL `.venv` sudah lengkap.
+
+## HintCache — Adaptive Heuristic Learning
+
+Setelah Refactor 3, sistem ditambahkan modul pembelajaran adaptif bernama
+**HintCache** (`src/hint_cache.py`). Modul ini membaca event log dari run
+sebelumnya dan menghasilkan hint yang digunakan langsung pada run berikutnya,
+tanpa model ML eksternal.
+
+### Cara Kerja
+
+Saat startup, `init_hint_cache(log_dir, scene_filter)` membaca semua file
+`*_events.csv` yang cocok dengan scene aktif. Data dibagi ke dalam
+**workspace bucket**:
+
+- **Reach bucket**: `near` (<0.5 m), `mid` (0.5–0.7 m), `far` (0.7–0.85 m), `borderline` (>0.85 m)
+- **Obstacle bucket**: `clear` (>0.28 m), `near` (0.12–0.28 m), `too_close` (<0.12 m)
+
+Dari data tersebut, HintCache menghasilkan tiga hint:
+
+| Hint | Fungsi |
+|---|---|
+| `preferred_backend()` | Skip Pinocchio untuk seluruh run jika tingkat FK-validation-failure ≥ 70% |
+| `pos_err_tolerance()` | Lebarkan batas penerimaan IK per bucket jika banyak kandidat "near miss" |
+| `preferred_grasp_profile()` | Pilih profil grasp dengan success rate tertinggi per `(obj_class, reach_bucket)` |
+
+Hint hanya aktif setelah minimal **5 data point** per bucket terkumpul
+(`MIN_SAMPLES`). Saat data belum cukup, sistem menggunakan default — jadi
+run pertama tetap aman.
+
+### Dampak Terukur
+
+Pada scene `separate_groups_ungroup_obs`, Pinocchio FK validation gagal di
+68% dari semua IK attempt (631/929). Ini menyebabkan runtime 22.5 menit di
+run pertama. Dari run kedua, HintCache mendeteksi pola ini dan skip
+Pinocchio secara otomatis, memotong runtime menjadi ±8 menit.
+
+### Penggunaan
+
+```bash
+# HintCache aktif (default)
+python scripts/separate_groups_ompl_only.py --object ungroup obs --no-viewer
+
+# HintCache dinonaktifkan (untuk baseline / perbandingan)
+python scripts/separate_groups_ompl_only.py --object ungroup obs --no-viewer --no-hint-cache
+```
+
+Flag `--no-hint-cache` tersedia di semua task script.
+
+Untuk melihat apa yang dipelajari HintCache pada suatu run:
+
+```bash
+grep "HINT_CACHE" logs/<run>_events.csv
+```
+
+### Parameter yang Bisa Di-tune
+
+| Env var | Default | Fungsi |
+|---|---|---|
+| `HINT_MIN_SAMPLES` | 5 | Minimum data per bucket sebelum hint aktif |
+| `HINT_PINOCCHIO_SKIP_RATE` | 0.70 | Threshold failure rate untuk skip Pinocchio |
+| `HINT_NEAR_MISS_RATE` | 0.40 | Fraksi near-miss untuk trigger toleransi lebih lebar |
+| `HINT_MAX_TOLERANCE_FACTOR` | 1.60 | Batas maksimum pelebaran toleransi IK |
