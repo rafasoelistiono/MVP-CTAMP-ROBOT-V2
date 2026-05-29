@@ -520,10 +520,17 @@ def _is_table_finger_pair(report) -> bool:
     return "table" in bodies and any(str(body).endswith(("left_finger", "right_finger")) for body in bodies)
 
 
+def _is_movable_finger_pair(report) -> bool:
+    bodies = {report.body1, report.body2}
+    return any(str(b).startswith(("cube", "circle")) for b in bodies if b) and \
+           any(str(b).endswith(("left_finger", "right_finger")) for b in bodies if b)
+
+
 def _check_live_collision(
     context: str,
     ignored_body_names: Optional[Sequence[str]] = None,
     allow_start_table_finger: bool = False,
+    allow_start_movable_finger: bool = False,
 ) -> bool:
     _live_collision_policy.set_ignored_bodies(ignored_body_names)
     mujoco.mj_forward(model, data)
@@ -531,6 +538,18 @@ def _check_live_collision(
     if report.valid:
         return True
     if allow_start_table_finger and _is_table_finger_pair(report):
+        _log_arm_state(
+            "COLLISION_CHECK",
+            "IGNORED_START",
+            phase=context,
+            failure_reason=report.reason,
+            collision_pair=[report.body1, report.body2],
+            contact_count=int(data.ncon),
+            penetration=round(float(getattr(report, "penetration", 0.0)), 5),
+            ignored_body_names=list(ignored_body_names or []),
+        )
+        return True
+    if allow_start_movable_finger and _is_movable_finger_pair(report):
         _log_arm_state(
             "COLLISION_CHECK",
             "IGNORED_START",
@@ -1047,6 +1066,7 @@ def _execute_joint_trajectory(
                 context=f"trajectory waypoint {waypoint_index}",
                 ignored_body_names=ignored_body_names,
                 allow_start_table_finger=waypoint_index == 0,
+                allow_start_movable_finger=waypoint_index == 0,
             ):
                 _log_arm_state(
                     "TRAJECTORY_EXEC",

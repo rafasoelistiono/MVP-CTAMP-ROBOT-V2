@@ -443,6 +443,73 @@ Hasil terakhir:
 Skip di Windows terjadi karena OMPL/Pinocchio tidak tersedia di interpreter
 aktif Windows, sedangkan WSL `.venv` sudah lengkap.
 
+## Live Scene State
+
+`src/scene_state.py` menyediakan fungsi `get_live_scene(executor)` yang membaca
+posisi objek langsung dari simulasi MuJoCo (`data.xpos`), bukan dari XML scene
+file. Ini adalah fondasi untuk integrasi LLM planner general-purpose — planner
+tidak lagi bergantung pada snapshot statis dari awal run.
+
+### Perbedaan dengan `_parse_scene()`
+
+| | `_parse_scene()` | `get_live_scene()` |
+|---|---|---|
+| Sumber data | XML file (posisi awal) | MuJoCo `data.xpos` (posisi aktual) |
+| Update | Sekali saat startup | Kapan saja selama run |
+| Object position | Posisi awal dari scene file | Posisi setelah semua physics step |
+| Deteksi held object | Tidak ada | Ya (dari finger width + z threshold) |
+| Deteksi fallen object | Tidak ada | Ya (z < 0.70 m) |
+| Obstacle position | Statis dari XML | Live (deteksi displacement) |
+| EE position | Tidak ada | Ya (`ee_xyz`) |
+
+### Schema Output
+
+```python
+from scene_state import get_live_scene
+import executor
+
+scene = get_live_scene(executor)
+# scene["movable_objects"]   — list objek yang bisa dipindah + belum jatuh
+# scene["held_object"]       — object_id yang sedang dipegang, atau None
+# scene["fallen_objects"]    — objek yang sudah jatuh dari meja
+# scene["ceramic_obstacles"] — posisi obstacle live
+# scene["robot"]["ee_xyz"]   — posisi end-effector saat ini
+# scene["counts"]            — {movable, ceramic, fallen}
+```
+
+Setiap objek di `movable_objects` menyertakan:
+
+```python
+{
+    "id": "cube1",
+    "class": "cube",           # cube / circle / cylinder
+    "position": [x, y, z],    # posisi aktual dari simulasi
+    "radius": 0.043,
+    "held": False,             # True jika sedang di gripper
+    "fallen": False,           # True jika z < 0.70 m
+    "reach_dist_m": 0.54,      # jarak XY dari base arm
+    "reach_status": "OK",      # OK / BORDERLINE / HARD
+    "obstacle_dist_m": 0.31,   # jarak ke obstacle terdekat
+    "obstacle_status": "CLEAR" # CLEAR / NEAR / TOO_CLOSE
+}
+```
+
+### Penggunaan
+
+```python
+import executor
+from scene_state import get_live_scene
+
+# Panggil kapan saja selama run untuk mendapat state terkini
+scene = get_live_scene(executor)
+
+# Cocok untuk feed ke LLM planner di setiap replanning round
+user_msg = {"goal": "tidy up", "current_scene": scene}
+```
+
+Schema ini identik dengan output `_parse_scene()` sehingga script task yang
+sudah ada dan LLM planner lama dapat langsung menggunakannya tanpa perubahan.
+
 ## HintCache — Adaptive Heuristic Learning
 
 Setelah Refactor 3, sistem ditambahkan modul pembelajaran adaptif bernama

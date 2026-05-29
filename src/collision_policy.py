@@ -67,6 +67,12 @@ class CollisionPolicy:
         self.finger_movable_penetration_tolerance = float(
             os.getenv("FINGER_MOVABLE_CONTACT_TOLERANCE", "0.018")
         )
+        # Tolerance for finger contact with non-ignored placed objects.
+        # Small enough to block transit paths sweeping through placed objects,
+        # large enough to allow post-release finger settling (~1-2 mm).
+        self.placed_object_finger_tolerance = float(
+            os.getenv("PLACED_OBJECT_FINGER_TOLERANCE", "0.003")
+        )
         self.table_finger_penetration_tolerance = float(
             os.getenv("TABLE_FINGER_CONTACT_TOLERANCE", "0.005")
         )
@@ -130,12 +136,13 @@ class CollisionPolicy:
                 if env_body in self.ignored_body_names:
                     continue
 
-                # Only explicitly ignored movable bodies, usually the current
-                # pick target or held object, may be touched. Other cubes and
-                # circles are treated as obstacles so transit paths do not bump
-                # through unrelated objects.
+                # Only explicitly ignored movable bodies (the current pick
+                # target or held object) may be touched by the fingers with
+                # the full grasp tolerance. All other placed objects use a
+                # very small tolerance (post-release settling only) so OMPL
+                # cannot plan paths that sweep through them.
                 if env_body is not None and self._is_movable_object(env_body):
-                    if self._is_finger_body(robot_body) and penetration <= self.finger_movable_penetration_tolerance:
+                    if self._is_finger_body(robot_body) and penetration <= self.placed_object_finger_tolerance:
                         continue
                     if self.allow_movable_object_contact:
                         continue
