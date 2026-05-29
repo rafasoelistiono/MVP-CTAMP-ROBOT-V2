@@ -84,23 +84,24 @@ def test_ungroup_obstacle_targets_keep_all_objects_with_near_challenges():
     assert cylinder_statuses["circle4"] == "CLEAR"
 
 
-def test_cube_stack_targets_have_three_base_cubes_and_one_top_cube_for_all_scenes():
+def test_cube_stack_targets_have_four_vertical_layers_for_all_scenes():
     for scene_key in ["group_no_obs", "ungroup_no_obs", "group_obs", "ungroup_obs"]:
         scene = prepare_scene_variant(scene_key)
         _, move_order, slots, skipped = _build_cube_stack_targets(str(scene))
 
-        assert set(move_order) == {"cube1", "cube2", "cube3", "cube4"}
+        assert move_order == ["cube1", "cube2", "cube3", "cube4"]
         assert not skipped
-        levels = [slots[object_id]["level"] for object_id in move_order]
-        assert levels.count(0) == 3
-        assert levels.count(1) == 1
-        for object_id in move_order:
-            slot = slots[object_id]
-            if slot["level"] == 0:
-                assert slot["support_object_id"] is None
-            else:
-                assert slot["support_object_id"] in move_order
-                assert slots[slot["support_object_id"]]["level"] == 0
+        assert [slots[object_id]["level"] for object_id in move_order] == [0, 1, 2, 3]
+        assert slots["cube1"]["support_object_id"] is None
+        assert slots["cube2"]["support_object_id"] == "cube1"
+        assert slots["cube3"]["support_object_id"] == "cube2"
+        assert slots["cube4"]["support_object_id"] == "cube3"
+
+        base_x, base_y, base_z = slots["cube1"]["target_pose"][:3]
+        for index, object_id in enumerate(move_order):
+            x, y, z = slots[object_id]["target_pose"][:3]
+            assert (x, y) == (base_x, base_y)
+            assert z == pytest.approx(base_z + index * 0.06, abs=0.0001)
 
 
 def test_ompl_dependent_regression_is_explicitly_skipped_when_missing():

@@ -1,25 +1,19 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="980" height="360" viewBox="0 0 980 360">
 <rect width="100%" height="100%" fill="#ffffff"/>
-<text x="36" y="42" font-size="24" font-weight="700" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Perubahan Fokus Failure per Milestone</text>
-<text x="36" y="68" font-size="13" font-weight="400" fill="#52616b" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Diringkas dari summary CSV dan event log yang paling representatif.</text>
-<rect x="42" y="112" width="280" height="190" rx="8" fill="#f7fafc" stroke="#7d8b99" stroke-width="2"/>
-<text x="60" y="142" font-size="17" font-weight="800" fill="#7d8b99" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Before refactor</text>
-<text x="60" y="176" font-size="22" font-weight="800" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Pick/lift gagal</text>
-<text x="60" y="206" font-size="14" font-weight="700" fill="#52616b" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Cubes 3/4, tabung 2/4</text>
-<text x="60" y="238" font-size="12" font-weight="400" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Root cause masih campur: object not lifted,</text>
-<text x="60" y="255" font-size="12" font-weight="400" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">contact finger-table, target borderline.</text>
-<rect x="347" y="112" width="280" height="190" rx="8" fill="#f7fafc" stroke="#5b8def" stroke-width="2"/>
-<text x="365" y="142" font-size="17" font-weight="800" fill="#5b8def" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Refactor 1</text>
-<text x="365" y="176" font-size="22" font-weight="800" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Diagnostik terbuka</text>
-<text x="365" y="206" font-size="14" font-weight="700" fill="#52616b" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Cubes 0/4 pada run Pinocchio</text>
-<text x="365" y="238" font-size="12" font-weight="400" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">IK_CANDIDATE menunjukkan 480</text>
-<text x="365" y="255" font-size="12" font-weight="400" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">ik_error_above_limit karena frame Pinocchio</text>
-<text x="365" y="272" font-size="12" font-weight="400" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">salah.</text>
-<rect x="652" y="112" width="280" height="190" rx="8" fill="#f7fafc" stroke="#1f9d55" stroke-width="2"/>
-<text x="670" y="142" font-size="17" font-weight="800" fill="#1f9d55" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Refactor 2</text>
-<text x="670" y="176" font-size="22" font-weight="800" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Runtime stabil</text>
-<text x="670" y="206" font-size="14" font-weight="700" fill="#52616b" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">No-obs final 16/16</text>
-<text x="670" y="238" font-size="12" font-weight="400" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">Base-frame conversion, FK validation,</text>
-<text x="670" y="255" font-size="12" font-weight="400" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">ignore-list grasp, ranking center grasp,</text>
-<text x="670" y="272" font-size="12" font-weight="400" fill="#17202a" text-anchor="start" style="font-family: Inter, Segoe UI, Arial, sans-serif;">far-grasp height.</text>
+<text x="490" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#111827">Failure Focus by Refactor Stage</text>
+<rect x="40" y="70" width="280" height="220" rx="6" fill="#f3f4f6" stroke="#d1d5db"/>
+<text x="180" y="100" text-anchor="middle" font-family="Arial, sans-serif" font-size="15" font-weight="700" fill="#111827">Refactor 1</text>
+<text x="60" y="135" font-family="Arial, sans-serif" font-size="13" fill="#374151">Baseline: far object pick failed.</text>
+<text x="60" y="160" font-family="Arial, sans-serif" font-size="13" fill="#374151">Cubes 3/4, tabung 2/4.</text>
+<text x="60" y="185" font-family="Arial, sans-serif" font-size="13" fill="#374151">Main signal: grasp/reach unstable.</text>
+<rect x="350" y="70" width="280" height="220" rx="6" fill="#eff6ff" stroke="#93c5fd"/>
+<text x="490" y="100" text-anchor="middle" font-family="Arial, sans-serif" font-size="15" font-weight="700" fill="#111827">Refactor 2</text>
+<text x="370" y="135" font-family="Arial, sans-serif" font-size="13" fill="#374151">IK/FK frame alignment fixed.</text>
+<text x="370" y="160" font-family="Arial, sans-serif" font-size="13" fill="#374151">Candidate ranking + grasp guard.</text>
+<text x="370" y="185" font-family="Arial, sans-serif" font-size="13" fill="#374151">All no-obstacle scenes: 4/4.</text>
+<rect x="660" y="70" width="280" height="220" rx="6" fill="#ecfdf5" stroke="#5eead4"/>
+<text x="800" y="100" text-anchor="middle" font-family="Arial, sans-serif" font-size="15" font-weight="700" fill="#111827">Refactor 3</text>
+<text x="680" y="135" font-family="Arial, sans-serif" font-size="13" fill="#374151">NEAR is cautious, not skip.</text>
+<text x="680" y="160" font-family="Arial, sans-serif" font-size="13" fill="#374151">Obstacle remains challenging.</text>
+<text x="680" y="185" font-family="Arial, sans-serif" font-size="13" fill="#374151">All obstacle scenes: 4/4.</text>
 </svg>
