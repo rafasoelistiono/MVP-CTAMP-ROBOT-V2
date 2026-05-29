@@ -29,10 +29,11 @@ from ctamp_task_utils import (
 
 REACH_BORDERLINE_M = 0.78
 REACH_HARD_M = 0.82
-OBSTACLE_TOO_CLOSE_M = 0.12
+OBSTACLE_TOO_CLOSE_M = 0.10
 OBSTACLE_NEAR_M = 0.18
 MAX_PICK_RETRY_SOURCE_SHIFT_M = 0.18
 TARGET_CERAMIC_BUFFER_M = 0.13
+PICK_OBSTACLE_BLOCKED_M = 0.10
 
 
 def _min_ceramic_distance_xy(obj, world_state) -> float:
@@ -84,6 +85,17 @@ def _terminal_pick_failure_reason(executor, object_id: str, world_state) -> str 
         return "object_outside_robot_reach_after_displacement"
     if source_shift > MAX_PICK_RETRY_SOURCE_SHIFT_M:
         return "object_displaced_after_failed_pick"
+    return None
+
+
+def _blocked_grasp_failure_reason(executor, object_id: str) -> str | None:
+    pos = _runtime_object_pose(executor, object_id)
+    obstacle_distance_fn = getattr(executor, "_min_obstacle_xy_distance", None)
+    if obstacle_distance_fn is None:
+        return None
+    obstacle_distance = obstacle_distance_fn(pos)
+    if obstacle_distance < PICK_OBSTACLE_BLOCKED_M:
+        return "object_blocked_by_obstacle_grasp_clearance"
     return None
 
 
@@ -334,7 +346,8 @@ def _build_aligned_cube_targets(scene_file: str, spacing: float = 0.11):
     start_x = goal_x - spacing * (len(eligible_cubes) - 1) / 2.0
     slots = {}
     occupied = []
-    for index, cube in enumerate(eligible_cubes):
+    target_cubes = sorted(eligible_cubes, key=lambda obj: (obj["position"][0], obj["position"][1], obj["id"]))
+    for index, cube in enumerate(target_cubes):
         radius = cube.get("radius", 0.043)
         base_x = start_x + index * spacing
         target_xy = _search_safe_target_xy(base_x, row_y, radius, world_state, occupied)
@@ -586,10 +599,13 @@ def main() -> int:
                     pending.append(object_id)
                 else:
                     actual_pos = _runtime_object_pose(executor, object_id)
+                    failure_reason = terminal_reason or "object_not_lifted_after_pick"
+                    if terminal_reason is None and pick_attempts[object_id] >= max_pick_attempts:
+                        failure_reason = _blocked_grasp_failure_reason(executor, object_id) or failure_reason
                     failed.append({
                         "object_id": object_id,
                         "stage": "pick",
-                        "failure_reason": terminal_reason or "object_not_lifted_after_pick",
+                        "failure_reason": failure_reason,
                         "z": pick_z,
                         "actual": [round(v, 4) for v in actual_pos],
                         "attempts": pick_attempts[object_id],

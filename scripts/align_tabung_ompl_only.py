@@ -18,6 +18,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from align_cubes_ompl_only import (
     OBSTACLE_NEAR_M,
+    _blocked_grasp_failure_reason,
     _min_ceramic_distance_xy,
     _obstacle_status,
     _parse_scene,
@@ -85,7 +86,8 @@ def _build_aligned_cylinder_targets(scene_file: str, spacing: float = 0.105):
     start_x = goal_x - spacing * (len(eligible) - 1) / 2.0
     slots = {}
     occupied = []
-    for index, obj in enumerate(eligible):
+    target_objects = sorted(eligible, key=lambda obj: (obj["position"][0], obj["position"][1], obj["id"]))
+    for index, obj in enumerate(target_objects):
         radius = obj.get("radius", 0.03)
         base_x = start_x + index * spacing
         target_xy = _search_safe_target_xy(base_x, row_y, radius, world_state, occupied)
@@ -104,7 +106,8 @@ def _build_aligned_cylinder_targets(scene_file: str, spacing: float = 0.105):
             "target_pose": [round(x, 4), round(y, 4), round(table["z_top"] + 0.04, 4), 1.0, 0.0, 0.0, 0.0],
         }
 
-    return world_state, list(slots.keys()), slots, skipped
+    move_order = sorted(slots.keys(), key=lambda object_id: slots[object_id]["target_pose"][0], reverse=True)
+    return world_state, move_order, slots, skipped
 
 
 def main() -> int:
@@ -317,10 +320,13 @@ def main() -> int:
                     pending.append(object_id)
                 else:
                     actual_pos = _runtime_object_pose(executor, object_id)
+                    failure_reason = terminal_reason or "object_not_lifted_after_pick"
+                    if terminal_reason is None and pick_attempts[object_id] >= max_pick_attempts:
+                        failure_reason = _blocked_grasp_failure_reason(executor, object_id) or failure_reason
                     failed.append({
                         "object_id": object_id,
                         "stage": "pick",
-                        "failure_reason": terminal_reason or "object_not_lifted_after_pick",
+                        "failure_reason": failure_reason,
                         "z": pick_z,
                         "actual": [round(v, 4) for v in actual_pos],
                         "attempts": pick_attempts[object_id],
@@ -398,7 +404,6 @@ def main() -> int:
                 )
                 if place_ok:
                     break
-                executor.drop(object_id)
                 _settle(executor, args.settle_after_place)
                 break
 

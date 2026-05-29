@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import time
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -41,8 +42,10 @@ OBSTACLE_SCENE_MOTION_DEFAULTS = {
     # Refactor 3: in obstacle scenes, "near" objects should execute with the
     # cautious high-clearance profile. Only the hard TOO_CLOSE band should stop
     # execution before the arm gets a chance to plan.
-    "MIN_PICK_OBSTACLE_CLEARANCE": "0.12",
-    "CAUTIOUS_OBSTACLE_CLEARANCE": "0.28",
+    "MIN_PICK_OBSTACLE_CLEARANCE": "0.10",
+    "CAUTIOUS_OBSTACLE_CLEARANCE": "0.22",
+    "OBSTACLE_CAUTIOUS_CUBE_GRIP": "0.008",
+    "OBSTACLE_CAUTIOUS_CYLINDER_GRIP": "0.012",
     "MAX_VALID_IK_CANDIDATES": "8",
     "OMPL_TIME_LIMIT": "8.0",
 }
@@ -99,26 +102,28 @@ VARIANT_OBJECTS = {
         "cube4": (0.32, -0.34, 0.83),
         "circle1": (-0.02, 0.24, COMPACT_CYLINDER_CENTER_Z),
         "circle2": (0.10, 0.32, COMPACT_CYLINDER_CENTER_Z),
-        "circle3": (0.22, 0.26, COMPACT_CYLINDER_CENTER_Z),
-        "circle4": (0.32, 0.34, COMPACT_CYLINDER_CENTER_Z),
+        "circle3": (0.21, 0.20, COMPACT_CYLINDER_CENTER_Z),
+        "circle4": (0.22, 0.42, COMPACT_CYLINDER_CENTER_Z),
     },
     "ungroup_obs": {
         "cube1": (-0.02, -0.46, 0.83),
-        "circle1": (0.12, -0.42, COMPACT_CYLINDER_CENTER_Z),
+        "circle1": (0.04, -0.42, COMPACT_CYLINDER_CENTER_Z),
         "cube2": (0.28, -0.40, 0.83),
         "circle2": (0.34, -0.32, COMPACT_CYLINDER_CENTER_Z),
         "cube3": (0.00, 0.24, 0.83),
         "circle3": (0.16, 0.32, COMPACT_CYLINDER_CENTER_Z),
-        "cube4": (0.30, 0.24, 0.83),
-        "circle4": (0.34, 0.34, COMPACT_CYLINDER_CENTER_Z),
+        "cube4": (0.21, 0.20, 0.83),
+        "circle4": (0.18, 0.44, COMPACT_CYLINDER_CENTER_Z),
     },
 }
 
 OBSTACLE_POSITIONS = {
-    # Refactor 3 validated obstacle mapping: keep obstacles in the workspace,
-    # but do not place them directly on the pick-place corridor of group scenes.
-    "obstacle1": (-0.18, -0.30, 0.89),
-    "obstacle2": (0.42, 0.18, 0.89),
+    # Refactor 3 obstacle mapping: obstacle1 and obstacle2 intentionally sit on
+    # different sides of the object clusters. obstacle2 stays on the far end and
+    # is moved slightly backward; obstacle1 challenges the front cube/cylinder
+    # approach without entering the hard TOO_CLOSE band.
+    "obstacle1": (0.11, -0.30, 0.89),
+    "obstacle2": (0.350, 0.27, 0.89),
 }
 
 
@@ -180,7 +185,7 @@ def prepare_scene_variant(raw: str | Iterable[str] | None) -> Path:
         worldbody.insert(link0_index + offset, body)
 
     _indent(root)
-    tmp_path = out_path.with_suffix(".tmp")
+    tmp_path = out_path.with_suffix(f".{os.getpid()}.tmp")
     tree.write(tmp_path, encoding="utf-8", xml_declaration=False)
     tmp_path.replace(out_path)
     return out_path

@@ -95,8 +95,11 @@ PICK_GRIP_SEQUENCE = (0.015, 0.011, 0.008)
 PICK_GRASP_OFFSET_SEQUENCE = (0.10, 0.10, 0.10)
 PICK_CLEARANCE_BONUS_SEQUENCE = (0.0, 0.035, 0.06)
 COMPACT_CYLINDER_PICK_GRIP_SEQUENCE = (0.014, 0.012, 0.010)
-COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE = (0.105, 0.095, 0.085)
+COMPACT_CYLINDER_PICK_GRASP_OFFSET_SEQUENCE = (0.095, 0.095, 0.085)
 CYLINDER_RETRY_MIN_GRASP_OFFSET = float(os.getenv("CYLINDER_RETRY_MIN_GRASP_OFFSET", "0.095"))
+CYLINDER_TIPPED_CENTER_Z = float(os.getenv("CYLINDER_TIPPED_CENTER_Z", "0.832"))
+CYLINDER_TIPPED_GRASP_OFFSET = float(os.getenv("CYLINDER_TIPPED_GRASP_OFFSET", "0.075"))
+CYLINDER_TIPPED_GRIP = float(os.getenv("CYLINDER_TIPPED_GRIP", "0.010"))
 OBSTACLE_CAUTIOUS_CUBE_GRIP = float(os.getenv("OBSTACLE_CAUTIOUS_CUBE_GRIP", "0.011"))
 OBSTACLE_CAUTIOUS_CYLINDER_GRIP = float(os.getenv("OBSTACLE_CAUTIOUS_CYLINDER_GRIP", "0.012"))
 HELD_Z_THRESHOLD = 0.90
@@ -811,6 +814,36 @@ def _target_xyz_candidates(target_xyz: Sequence[float], label: str) -> list[np.n
             np.array([0.0, -0.025, 0.0]),
         ]
         candidates.extend(base + offset for offset in xy_offsets)
+        if _obstacle_ids:
+            nearest_xy = None
+            nearest_distance = float("inf")
+            for obstacle_id in _obstacle_ids.values():
+                obstacle_xy = data.xpos[obstacle_id][:2].copy()
+                distance = float(np.linalg.norm(xy - obstacle_xy))
+                if distance < nearest_distance:
+                    nearest_distance = distance
+                    nearest_xy = obstacle_xy
+            if nearest_xy is not None and nearest_distance < CAUTIOUS_OBSTACLE_CLEARANCE:
+                away = xy - nearest_xy
+                away_norm = float(np.linalg.norm(away))
+                away_dir = away / away_norm if away_norm > 1e-6 else radial_dir
+                tangent_dir = np.array([-away_dir[1], away_dir[0]])
+                if "grasp" in label and "pregrasp" not in label:
+                    if not label.startswith("pick(circle"):
+                        for offset in (
+                            np.array([0.015, -0.04, 0.0]),
+                            np.array([0.0, -0.045, 0.0]),
+                            np.array([-0.045, -0.012, 0.0]),
+                            np.array([-0.045, -0.03, 0.0]),
+                        ):
+                            candidates.append(base + offset)
+                    for away_offset in (0.018, 0.028, 0.038):
+                        candidates.append(base + np.r_[away_dir * away_offset, -0.012])
+                    for side_offset in (0.014, -0.014):
+                        candidates.append(base + np.r_[away_dir * 0.03 + tangent_dir * side_offset, -0.01])
+                else:
+                    for away_offset in (0.04, 0.065, 0.09):
+                        candidates.append(base + np.r_[away_dir * away_offset, 0.0])
 
         # For far objects, approach from the robot-facing side and avoid an
         # unnecessarily high vertical pregrasp that pushes IK outside workspace.
@@ -1412,7 +1445,7 @@ def set_grip(target: float, steps: int = 200):
 def drop(ignored_body_name: Optional[str] = None):
     """Emergency release at the current arm position."""
     global _held_grip_target
-    ignored = [ignored_body_name] if ignored_body_name else None
+    ignored = [ignored_body_name] if _held_object_name is not None and ignored_body_name else None
     _log_arm_state("DROP", "START", object_id=_held_object_name or ignored_body_name, ignored_body_names=ignored or [])
     set_grip(0.04, steps=300)
     for _ in range(120):
@@ -1545,6 +1578,20 @@ def pick(obj):
             failure_reason=pose_failure_reason,
         )
         return
+    if is_circle and float(cube_pos[2]) < CYLINDER_TIPPED_CENTER_Z:
+        grasp_offset = min(grasp_offset, CYLINDER_TIPPED_GRASP_OFFSET)
+        grip_target = min(grip_target, CYLINDER_TIPPED_GRIP)
+        clearance_bonus += 0.02
+        _log_arm_state(
+            "PICK_PROFILE",
+            "TIPPED_CYLINDER",
+            object_id=obj,
+            object_z=round(float(cube_pos[2]), 4),
+            threshold=CYLINDER_TIPPED_CENTER_Z,
+            grip=grip_target,
+            grasp_offset=grasp_offset,
+            clearance_bonus=clearance_bonus,
+        )
     obstacle_distance = _min_obstacle_xy_distance(cube_pos)
     approach_clearance = APPROACH_CLEARANCE + clearance_bonus
     cautious_motion = False
@@ -1579,6 +1626,16 @@ def pick(obj):
             grip_target,
             OBSTACLE_CAUTIOUS_CYLINDER_GRIP if is_circle else OBSTACLE_CAUTIOUS_CUBE_GRIP,
         )
+        if not is_circle and obstacle_distance < 0.12:
+            grip_target = min(grip_target, 0.007)
+            _log_arm_state(
+                "PICK_PROFILE",
+                "TIGHT_OBSTACLE_CUBE",
+                object_id=obj,
+                obstacle_distance=round(float(obstacle_distance), 4),
+                grip=grip_target,
+                grasp_offset=grasp_offset,
+            )
         print(
             f"[exec][OBSTACLE_AVOID] {obj} near obstacle "
             f"distance={obstacle_distance:.3f}m; using cautious high-clearance approach"
@@ -1602,6 +1659,17 @@ def pick(obj):
 
     cube_ref = cube_null_ref(cube_pos)
     object_xy_distance = float(np.linalg.norm(cube_pos[:2] - BASE_XY))
+    if is_circle and object_xy_distance > FAR_PICK_XY_DISTANCE:
+        grip_target = max(grip_target, 0.014)
+        grasp_offset = max(grasp_offset, 0.105)
+        _log_arm_state(
+            "PICK_PROFILE",
+            "FAR_CYLINDER",
+            object_id=obj,
+            grip=grip_target,
+            grasp_offset=grasp_offset,
+            xy_distance=round(object_xy_distance, 4),
+        )
     if object_xy_distance > FAR_PICK_XY_DISTANCE:
         grasp_offset += 0.02
     pregrasp_clearance = approach_clearance
@@ -1638,6 +1706,7 @@ def pick(obj):
         label=f"pick({obj}) pregrasp",
         cautious_motion=cautious_motion,
     ):
+        _check_obstacles_fallen(f"pick({obj}) pregrasp")
         _log_arm_state("PICK", "FAILED", object_id=obj, phase="pregrasp", target_xyz=_round_vec(pregrasp_xyz, 4), failure_reason="move_pregrasp_failed")
         return
 
@@ -1650,6 +1719,7 @@ def pick(obj):
         label=f"pick({obj}) grasp",
         cautious_motion=cautious_motion,
     ):
+        _check_obstacles_fallen(f"pick({obj}) grasp")
         _log_arm_state("PICK", "FAILED", object_id=obj, phase="grasp", target_xyz=_round_vec(grasp_xyz, 4), failure_reason="move_grasp_failed")
         return
 
@@ -1676,6 +1746,7 @@ def pick(obj):
         # closed-loop system replan from the table state.
         drop(obj)
         _held_object_name = None
+        _check_obstacles_fallen(f"pick({obj}) lift")
         _log_arm_state("PICK", "FAILED", object_id=obj, phase="lift", target_xyz=_round_vec(lift_xyz, 4), failure_reason="move_lift_failed")
         return
 
@@ -1686,16 +1757,30 @@ def pick(obj):
         _log_arm_state("PICK", "FAILED", object_id=obj, phase="lift_check", failure_reason="object_not_lifted", object_z=round(z, 4))
         drop(obj)
         _held_object_name = None
+        _check_obstacles_fallen(f"pick({obj}) lift_check")
         return
     _log_arm_state("PICK", "OK", object_id=obj, object_z=round(z, 4))
 
 
 
-def place(x, y, obj=None):
+def place(
+    x,
+    y,
+    obj=None,
+    target_z: float = 0.83,
+    release_lift: float = 0.06,
+    post_place_ignored_body_names: Optional[Sequence[str]] = None,
+):
     global _held_object_name, _held_grip_target
 
-    print(f"[exec] place({x:.3f}, {y:.3f})")
-    _log_arm_state("PLACE", "START", object_id=obj or _held_object_name, target_xyz=[round(float(x), 4), round(float(y), 4), 0.83])
+    print(f"[exec] place({x:.3f}, {y:.3f}, z={target_z:.3f})")
+    _log_arm_state(
+        "PLACE",
+        "START",
+        object_id=obj or _held_object_name,
+        target_xyz=[round(float(x), 4), round(float(y), 4), round(float(target_z), 4)],
+        release_lift=round(float(release_lift), 4),
+    )
     if _held_object_name is None:
         print("[exec] no cube is currently held")
         _log_arm_state("PLACE", "FAILED", object_id=obj, failure_reason="no_object_held")
@@ -1703,9 +1788,10 @@ def place(x, y, obj=None):
 
     obj = _held_object_name
 
-    # Settled cube centre after release.
-    place_pos = np.array([x, y, 0.83])
-    release_pos = np.array([x, y, 0.89])
+    # Settled object centre after release. target_z defaults to the table
+    # placement height; stacking scripts pass a higher target_z for upper cubes.
+    place_pos = np.array([x, y, target_z])
+    release_pos = np.array([x, y, target_z + release_lift])
     place_ref = cube_null_ref(place_pos)
     obstacle_distance = _min_obstacle_xy_distance(place_pos)
     approach_clearance = APPROACH_CLEARANCE
@@ -1755,7 +1841,7 @@ def place(x, y, obj=None):
         grip=_held_grip_target,
         null_ref=place_ref,
         ignored_body_names=[obj],
-        label=f"place({x:.3f}, {y:.3f}) preplace",
+        label=f"place({x:.3f}, {y:.3f}, {target_z:.3f}) preplace",
         cautious_motion=cautious_motion,
     ):
         drop(obj)
@@ -1769,7 +1855,7 @@ def place(x, y, obj=None):
         grip=_held_grip_target,
         null_ref=place_ref,
         ignored_body_names=[obj],
-        label=f"place({x:.3f}, {y:.3f}) release",
+        label=f"place({x:.3f}, {y:.3f}, {target_z:.3f}) release",
         cautious_motion=cautious_motion,
     ):
         drop(obj)
@@ -1800,17 +1886,27 @@ def place(x, y, obj=None):
         grip=0.04,
         null_ref=place_ref,
         ignored_body_names=[obj],
-        label=f"place({x:.3f}, {y:.3f}) retreat",
+        label=f"place({x:.3f}, {y:.3f}, {target_z:.3f}) retreat",
         cautious_motion=cautious_motion,
     ):
         # Retreat failure after release is not fatal, but we still keep the
         # controller in a safe open state.
-        print(f"[exec] retreat failed after place({x:.3f}, {y:.3f})")
+        print(f"[exec] retreat failed after place({x:.3f}, {y:.3f}, {target_z:.3f})")
         _log_arm_state("PLACE", "RETREAT_FAILED", object_id=obj, target_xyz=_round_vec(retreat_xyz, 4), failure_reason="retreat_failed_after_release")
 
     _held_object_name = None
     _held_grip_target = 0.015
-    _move_to_grasp_ready(f"after place({x:.3f}, {y:.3f})", grip=0.04, ignored_body_names=[obj])
-    _check_obstacles_fallen(f"place({x:.3f}, {y:.3f})")
-    _log_arm_state("PLACE", "OK", object_id=obj, target_xyz=[round(float(x), 4), round(float(y), 4), 0.83])
+    post_place_ignored = [obj] if post_place_ignored_body_names is None else list(post_place_ignored_body_names)
+    _move_to_grasp_ready(
+        f"after place({x:.3f}, {y:.3f}, {target_z:.3f})",
+        grip=0.04,
+        ignored_body_names=post_place_ignored or None,
+    )
+    _check_obstacles_fallen(f"place({x:.3f}, {y:.3f}, {target_z:.3f})")
+    _log_arm_state(
+        "PLACE",
+        "OK",
+        object_id=obj,
+        target_xyz=[round(float(x), 4), round(float(y), 4), round(float(target_z), 4)],
+    )
 
