@@ -161,7 +161,7 @@ ALLOW_MOVABLE_OBJECT_CONTACT=false
 | Env | Fungsi |
 |---|---|
 | `MODEL_FILE` | File XML MuJoCo yang dimuat oleh executor. Task script biasanya mengisi ini otomatis dari scene variant. |
-| `ENABLE_VIEWER` | `true` membuka MuJoCo viewer, `false` untuk headless/CI/WSL no-viewer. |
+| `ENABLE_VIEWER` | `true` membuka MuJoCo viewer, `false` untuk mode headless/CI/WSL tanpa viewer. |
 | `IK_BACKEND` | `auto`, `pinocchio`, atau `mujoco_dls`. `auto` memakai Pinocchio bila tersedia dan fallback ke MuJoCo DLS. |
 | `IK_REQUIRE_PINOCCHIO` | Jika `true`, program gagal jika Pinocchio tidak tersedia. |
 | `IK_PLAN_POS_ERR_LIMIT` | Batas error posisi IK untuk gerak plan/release. |
@@ -205,47 +205,47 @@ python -m pytest -q
 Align cubes:
 
 ```bash
-python scripts/align_cubes_ompl_only.py --object group no obs --no-viewer
-python scripts/align_cubes_ompl_only.py --object ungroup no obs --no-viewer
-python scripts/align_cubes_ompl_only.py --object group obs --no-viewer
-python scripts/align_cubes_ompl_only.py --object ungroup obs --no-viewer
-python scripts/align_cubes_ompl_only.py --object group long obs --no-viewer
-python scripts/align_cubes_ompl_only.py --object ungroup long obs --no-viewer
+python scripts/align_cubes_ompl_only.py --object group no obs
+python scripts/align_cubes_ompl_only.py --object ungroup no obs
+python scripts/align_cubes_ompl_only.py --object group obs
+python scripts/align_cubes_ompl_only.py --object ungroup obs
+python scripts/align_cubes_ompl_only.py --object group long obs
+python scripts/align_cubes_ompl_only.py --object ungroup long obs
 ```
 
 Align tabung:
 
 ```bash
-python scripts/align_tabung_ompl_only.py --object group no obs --no-viewer
-python scripts/align_tabung_ompl_only.py --object ungroup no obs --no-viewer
-python scripts/align_tabung_ompl_only.py --object group obs --no-viewer
-python scripts/align_tabung_ompl_only.py --object ungroup obs --no-viewer
-python scripts/align_tabung_ompl_only.py --object group long obs --no-viewer
-python scripts/align_tabung_ompl_only.py --object ungroup long obs --no-viewer
+python scripts/align_tabung_ompl_only.py --object group no obs
+python scripts/align_tabung_ompl_only.py --object ungroup no obs
+python scripts/align_tabung_ompl_only.py --object group obs
+python scripts/align_tabung_ompl_only.py --object ungroup obs
+python scripts/align_tabung_ompl_only.py --object group long obs
+python scripts/align_tabung_ompl_only.py --object ungroup long obs
 ```
 
 Stack cubes:
 
 ```bash
-python scripts/stack_cubes_ompl_only.py --object group no obs --no-viewer
-python scripts/stack_cubes_ompl_only.py --object ungroup no obs --no-viewer
-python scripts/stack_cubes_ompl_only.py --object group obs --no-viewer
-python scripts/stack_cubes_ompl_only.py --object ungroup obs --no-viewer
+python scripts/stack_cubes_ompl_only.py --object group no obs
+python scripts/stack_cubes_ompl_only.py --object ungroup no obs
+python scripts/stack_cubes_ompl_only.py --object group obs
+python scripts/stack_cubes_ompl_only.py --object ungroup obs
 ```
 
 Separate groups:
 
 ```bash
-python scripts/separate_groups_ompl_only.py --object group no obs --no-viewer
-python scripts/separate_groups_ompl_only.py --object ungroup no obs --no-viewer
-python scripts/separate_groups_ompl_only.py --object group obs --no-viewer
-python scripts/separate_groups_ompl_only.py --object ungroup obs --no-viewer
+python scripts/separate_groups_ompl_only.py --object group no obs
+python scripts/separate_groups_ompl_only.py --object ungroup no obs
+python scripts/separate_groups_ompl_only.py --object group obs
+python scripts/separate_groups_ompl_only.py --object ungroup obs
 ```
 
 HintCache aktif secara default. Untuk baseline tanpa HintCache:
 
 ```bash
-python scripts/align_cubes_ompl_only.py --object group obs --no-viewer --no-hint-cache
+python scripts/align_cubes_ompl_only.py --object group obs --no-hint-cache
 ```
 
 ## 3. Step by Step Robot
@@ -659,10 +659,10 @@ Pinocchio secara otomatis, memotong runtime menjadi +/-8 menit.
 
 ```bash
 # HintCache aktif (default)
-python scripts/separate_groups_ompl_only.py --object ungroup obs --no-viewer
+python scripts/separate_groups_ompl_only.py --object ungroup obs
 
 # HintCache dinonaktifkan (untuk baseline / perbandingan)
-python scripts/separate_groups_ompl_only.py --object ungroup obs --no-viewer --no-hint-cache
+python scripts/separate_groups_ompl_only.py --object ungroup obs --no-hint-cache
 ```
 
 Flag `--no-hint-cache` tersedia di semua task script.
@@ -828,5 +828,4 @@ Validasi runtime WSL yang sudah dilakukan:
 | Align tabung | `ungroup obs` | `success=True`, `objects_moved=4` |
 | Stack cubes | `group no obs` | `success=True`, 4 layer |
 | Stack cubes | `ungroup obs` | `success=True`, 4 layer |
-
 
