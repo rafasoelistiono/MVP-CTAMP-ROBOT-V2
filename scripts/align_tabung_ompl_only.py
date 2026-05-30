@@ -17,8 +17,14 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from align_cubes_ompl_only import (
+    ALIGN_PLACE_X_TOLERANCE_M,
+    ALIGN_PLACE_Y_TOLERANCE_M,
+    ALIGN_TARGET_ROW_BAND_M,
     OBSTACLE_NEAR_M,
+    LONG_OBSTACLE_SIDE_ACCESS_BLOCKED_M,
     _blocked_grasp_failure_reason,
+    _check_aligned_target,
+    _long_obstacle_mode,
     _min_ceramic_distance_xy,
     _obstacle_status,
     _parse_scene,
@@ -28,6 +34,7 @@ from align_cubes_ompl_only import (
     _search_safe_target_xy,
     _settle,
     _terminal_pick_failure_reason,
+    _validate_aligned_targets,
 )
 from ctamp_task_utils import (
     apply_conservative_motion_defaults,
@@ -36,6 +43,7 @@ from ctamp_task_utils import (
     normalize_scene_key,
     obstacle_mode_for_scene,
     prepare_scene_variant,
+    safe_process_exit,
     write_summary_csv,
 )
 
@@ -57,9 +65,20 @@ def _build_aligned_cylinder_targets(scene_file: str, spacing: float = 0.105):
 
     skipped = []
     eligible = []
+    long_obstacle_mode = _long_obstacle_mode(world_state)
     for obj in cylinders:
         obstacle_status = _obstacle_status(obj, world_state)
         reach_status = _reach_status(obj, world_state)
+        obstacle_distance = _min_ceramic_distance_xy(obj, world_state)
+        if long_obstacle_mode and obstacle_distance <= LONG_OBSTACLE_SIDE_ACCESS_BLOCKED_M:
+            skipped.append({
+                "object_id": obj["id"],
+                "stage": "precheck",
+                "failure_reason": "object_blocked_by_long_obstacle_side_access",
+                "obstacle_distance": round(obstacle_distance, 4),
+                "obstacle_status": obstacle_status,
+            })
+            continue
         if obstacle_status == "TOO_CLOSE":
             skipped.append({
                 "object_id": obj["id"],
@@ -82,7 +101,7 @@ def _build_aligned_cylinder_targets(scene_file: str, spacing: float = 0.105):
 
     table = world_state["table"]
     goal_x, goal_y, _ = world_state["goal_center"]
-    row_y = goal_y + 0.065
+    row_y = goal_y
     start_x = goal_x - spacing * (len(eligible) - 1) / 2.0
     slots = {}
     occupied = []
@@ -90,7 +109,15 @@ def _build_aligned_cylinder_targets(scene_file: str, spacing: float = 0.105):
     for index, obj in enumerate(target_objects):
         radius = obj.get("radius", 0.03)
         base_x = start_x + index * spacing
-        target_xy = _search_safe_target_xy(base_x, row_y, radius, world_state, occupied)
+        target_xy = _search_safe_target_xy(
+            base_x,
+            row_y,
+            radius,
+            world_state,
+            occupied,
+            y_min=row_y - ALIGN_TARGET_ROW_BAND_M,
+            y_max=row_y + ALIGN_TARGET_ROW_BAND_M,
+        )
         if target_xy is None:
             skipped.append({
                 "object_id": obj["id"],
@@ -114,7 +141,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Arrange cylinders into one straight aligned row using OMPL + MuJoCo collision checking only."
     )
-    parser.add_argument("--object", nargs="+", default=["group", "no", "obs"], help="Scene: group no obs, ungroup no obs, group obs, ungroup obs.")
+    parser.add_argument(
+        "--object",
+        nargs="+",
+        default=["group", "no", "obs"],
+        help="Scene: group no obs, ungroup no obs, group obs, ungroup obs, group long obs, ungroup long obs.",
+    )
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument("--no-hint-cache", action="store_true", help="Disable HintCache adaptive learning (use fixed defaults).")
@@ -145,7 +177,11 @@ def main() -> int:
 
     world_state, move_order, slots_by_object, skipped_precheck = _build_aligned_cylinder_targets(str(scene_file))
     if not move_order:
-        print("[ALIGN_TABUNG] Tidak ada tabung dengan target aman untuk disusun.")
+        print("[ALIGN_TABUNG] Tidak ada tabung dengan akses aman untuk disusun.")
+        if skipped_precheck:
+            print("[ALIGN_TABUNG] Skipped before target allocation:")
+            for item in skipped_precheck:
+                print(f"  - {item['object_id']}: {item['failure_reason']}")
         return 1
 
     print("[ALIGN_TABUNG] Task          : susun tabung bersusun sejajar")
@@ -389,7 +425,17 @@ def main() -> int:
                     break
                 _settle(executor, args.settle_after_place)
                 place_ok, actual = feedback.check_place(executor.model, executor.data, executor.name_to_cube[object_id], x, y)
+                align_ok, align_details = _check_aligned_target(
+                    executor,
+                    object_id,
+                    target_pose,
+                    z_threshold=feedback.PLACED_Z_THRESHOLD,
+                )
                 print(f"[{index:02d}] CHECK_PLACE  {'OK' if place_ok else 'FAIL'} retry={retry} actual={actual}")
+                print(
+                    f"[{index:02d}] CHECK_ALIGN_PLACE {'OK' if align_ok else 'FAIL'} "
+                    f"x_error={align_details['x_error']:.4f} y_error={align_details['y_error']:.4f}"
+                )
                 place_error = math.dist((actual[0], actual[1]), (x, y)) if actual else None
                 log_event(
                     "CHECK_PLACE",
@@ -402,6 +448,22 @@ def main() -> int:
                     distance_to_target=round(place_error, 4) if place_error is not None else None,
                     failure_reason=None if place_ok else "object_not_on_target_after_place",
                 )
+                log_event(
+                    "CHECK_ALIGN_PLACE",
+                    "OK" if align_ok else "FAILED",
+                    object_id=object_id,
+                    phase="place",
+                    attempt=retry,
+                    target_xyz=align_details["target_xyz"],
+                    actual_xyz=align_details["actual_xyz"],
+                    x_error=align_details["x_error"],
+                    y_error=align_details["y_error"],
+                    x_tolerance=ALIGN_PLACE_X_TOLERANCE_M,
+                    y_tolerance=ALIGN_PLACE_Y_TOLERANCE_M,
+                    failure_reason=None if align_ok else align_details["failure_reason"],
+                )
+                place_ok = place_ok and align_ok
+                actual = align_details["actual_xyz"]
                 if place_ok:
                     break
                 _settle(executor, args.settle_after_place)
@@ -433,8 +495,68 @@ def main() -> int:
                         "actual": actual,
                     })
 
+        invalid_alignment = _validate_aligned_targets(
+            executor,
+            moved,
+            slots_by_object,
+            z_threshold=feedback.PLACED_Z_THRESHOLD,
+        )
+        for item in invalid_alignment:
+            object_id = item["object_id"]
+            if object_id not in moved:
+                continue
+            print(
+                f"[ROUND {retry_round}] ALIGNMENT_RECHECK FAIL object={object_id} "
+                f"reason={item['failure_reason']} actual={item['actual_xyz']}"
+            )
+            log_event(
+                "ALIGNMENT_RECHECK",
+                "FAILED",
+                object_id=object_id,
+                phase="post_round",
+                actual_xyz=item["actual_xyz"],
+                target_xyz=item["target_xyz"],
+                x_error=item.get("x_error"),
+                y_error=item.get("y_error"),
+                row_y_spread=item.get("row_y_spread"),
+                failure_reason=item["failure_reason"],
+            )
+            moved.remove(object_id)
+            placed_targets.pop(object_id, None)
+            already_failed = any(entry.get("object_id") == object_id for entry in failed)
+            if pick_attempts.get(object_id, 0) < max_pick_attempts:
+                if object_id not in pending:
+                    pending.append(object_id)
+                log_event(
+                    "DEFER_OBJECT",
+                    "RETRY_LATER",
+                    object_id=object_id,
+                    phase="alignment",
+                    failure_reason=item["failure_reason"],
+                    attempt=pick_attempts.get(object_id, 0),
+                    max_attempts=max_pick_attempts,
+                )
+            elif not already_failed:
+                failed.append({
+                    "object_id": object_id,
+                    "stage": "alignment",
+                    "failure_reason": item["failure_reason"],
+                    "actual": item["actual_xyz"],
+                    "target": item["target_xyz"],
+                    "attempts": pick_attempts.get(object_id, 0),
+                })
+
     duration_ms = int((time.perf_counter() - started) * 1000)
-    success = len(failed) == 0
+    failed_ids = {item.get("object_id") for item in failed}
+    for object_id in move_order:
+        if object_id not in moved and object_id not in failed_ids:
+            failed.append({
+                "object_id": object_id,
+                "stage": "alignment",
+                "failure_reason": "object_missing_from_final_aligned_row",
+                "attempts": pick_attempts.get(object_id, 0),
+            })
+    success = len(failed) == 0 and len(moved) == len(move_order)
     print("\n=== Align tabung OMPL-only summary ===")
     print(f"success={success}")
     print(f"objects_moved={len(moved)}")
@@ -459,8 +581,9 @@ def main() -> int:
     print(f"csv_log={csv_path}")
     print(f"event_csv_log={event_csv_path}")
     flush_trace()
+    executor.shutdown_runtime()
     return 0 if not failed else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    safe_process_exit(main())

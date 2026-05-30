@@ -8,8 +8,6 @@ pytest>=8.0
 ompl>=1.6.0
 pandas>=2.2.0
 matplotlib>=3.8.0
-ipykernel>=6.0
-nbformat>=5.9
 
 # OMPL Python bindings are required for the OMPL-only task scripts and planner.
 # On Linux/WSL this may work:

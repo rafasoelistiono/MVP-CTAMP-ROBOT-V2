@@ -1,419 +1,126 @@
-# MVP CTAMP Robot - OMPL Only
+# Laporan MVP CTAMP Robot V2
 
-Repository ini difokuskan untuk simulasi Franka Panda di MuJoCo dengan IK dan
-OMPL joint-space planning. Jalur normal gerak arm adalah:
+Repository ini berisi simulasi robot arm Franka Panda untuk task pick and place
+berbasis MuJoCo, Pinocchio IK, OMPL motion planning, collision policy, feedback
+validation, dan HintCache. Fokus MVP adalah menjalankan task object manipulation
+secara terukur pada scene static:
 
-```text
-task script -> scene variant -> IK candidates -> MuJoCo FK validation
-            -> joint/state/collision validity -> OMPL plan -> trajectory execution
-            -> pick/place feedback -> summary + event logs
+- Align cubes: menyusun 4 kubus sejajar pada goal area.
+- Align tabung: menyusun 4 silinder/tabung sejajar pada goal area.
+- Stack cubes: menyusun 4 kubus menjadi satu tower 4 lapisan.
+- Separate groups: memisahkan object berdasarkan kelompok target.
+
+Raw `logs/`, cache pytest, notebook lama, SVG matriks lama, dan output notebook
+lama sudah dibersihkan. Mesh di `assets/` tetap dipertahankan karena dibutuhkan
+oleh MuJoCo model.
+
+## 1. Pengenalan Pipeline Robot
+
+Secara garis besar, pipeline robot tidak menggerakkan arm langsung dari satu
+koordinat ke koordinat lain. Setiap aksi melewati rangkaian validasi: scene
+dibuat, target object dipilih, reachability dicek, IK menghasilkan kandidat
+joint, MuJoCo memvalidasi FK/state, OMPL merencanakan jalur, trajectory
+dieksekusi dengan collision checking, lalu feedback memastikan object benar
+terangkat atau benar diletakkan.
+
+```mermaid
+flowchart TD
+    A[Task script dipanggil] --> B[prepare_scene_variant membuat scene XML]
+    B --> C[Parse world state: object, obstacle, goal area]
+    C --> D[Build target task: align row atau cube stack]
+    D --> E{Object valid dan reachable?}
+    E -- Tidak --> F[Skip/fail dengan reason eksplisit]
+    E -- Ya --> G[executor.pick object]
+    G --> H[Precheck obstacle dan workspace]
+    H --> I[IK candidate generation]
+    I --> J[Pinocchio IK + MuJoCo FK validation]
+    J --> K[MuJoCo DLS fallback jika perlu]
+    K --> L[Joint limit dan planner state validity]
+    L --> M[OMPL plan path]
+    M --> N[Execute trajectory + live collision check]
+    N --> O[Gripper close dan lift]
+    O --> P{check_pick OK?}
+    P -- Tidak --> Q[Drop, settle, retry/defer]
+    P -- Ya --> R[executor.place ke goal]
+    R --> S[Preplace, release, retreat]
+    S --> T{check_place / align / stack OK?}
+    T -- Tidak --> U[Retry, re-pick, atau fail reason]
+    T -- Ya --> V[Summary CSV dan event log]
 ```
 
-Direct IK movement tetap bukan jalur utama. IK hanya menghasilkan `goal_q`;
-gerak fisik tetap lewat OMPL.
+kode utama:
 
-## Status Validasi
+| Tahap | Lokasi kode | Peran |
+|---|---|---|
+| Scene generation | `scripts/ctamp_task_utils.py:177` | `prepare_scene_variant()` membuat XML scene sesuai kondisi task. |
+| Align cube target | `scripts/align_cubes_ompl_only.py:394` | `_build_aligned_cube_targets()` memilih cube dan target row. |
+| Align tabung target | `scripts/align_tabung_ompl_only.py:51` | `_build_aligned_cylinder_targets()` memilih tabung dan target row. |
+| Stack target | `scripts/stack_cubes_ompl_only.py:65` | `_build_cube_stack_targets()` membuat tower 4 layer. |
+| Pick action | `src/executor.py:1522` | `pick()` menjalankan pregrasp, grasp, grip close, lift. |
+| Place action | `src/executor.py:1792` | `place()` menjalankan preplace, release, retreat. |
+| IK ranking | `src/executor.py:916` | `_ranked_ik_goals()` membuat dan memvalidasi kandidat IK. |
+| OMPL plan | `src/executor.py:1130` | `_move_with_ompl()` merencanakan path joint-space. |
+| Trajectory execution | `src/executor.py:1043` | `_execute_joint_trajectory()` mengeksekusi waypoint dan cek collision. |
+| Collision policy | `src/collision_policy.py:42` | `CollisionPolicy` mengklasifikasi contact valid/tidak valid. |
+| Feedback | `src/feedback.py:18`, `src/feedback.py:54` | `check_pick()` dan `check_place()` memvalidasi hasil aksi. |
+| HintCache | `src/hint_cache.py:78` | `HintCache` membaca event log lama untuk hint backend/profile/toleransi. |
 
-Validasi final no-obstacle dari log terbaru:
+## 2. Setup Instalasi
 
-![Final no-obstacle success matrix](docs/final_no_obs_success_matrix.svg)
+### Setup WSL Ubuntu 22.04 dari Windows
 
-| Task | Scene | Result | Log summary |
-|---|---|---:|---|
-| Cubes | `group_no_obs` | 4/4 | `align_cubes_group_no_obs_20260528_225524.csv` |
-| Cubes | `ungroup_no_obs` | 4/4 | `align_cubes_ungroup_no_obs_20260528_225522.csv` |
-| Tabung | `group_no_obs` | 4/4 | `align_tabung_group_no_obs_20260528_231832.csv` |
-| Tabung | `ungroup_no_obs` | 4/4 | `align_tabung_ungroup_no_obs_20260528_232124.csv` |
-
-Validasi final obstacle setelah Refactor 3:
-
-![Final obstacle success matrix](docs/final_obs_success_matrix.svg)
-
-| Task | Scene | Result | Log summary |
-|---|---|---:|---|
-| Cubes | `group_obs` | 4/4 | `align_cubes_group_obs_20260528_222451.csv` |
-| Cubes | `ungroup_obs` | 4/4 | `align_cubes_ungroup_obs_20260528_222638.csv` |
-| Tabung | `group_obs` | 4/4 | `align_tabung_group_obs_20260528_231917.csv` |
-| Tabung | `ungroup_obs` | 4/4 | `align_tabung_ungroup_obs_20260528_232220.csv` |
-
-Validasi cube stacking setelah penyesuaian top placement:
-
-![Final cube stack success matrix](docs/final_stack_success_matrix.svg)
-
-| Task | Scene | Result | Log summary |
-|---|---|---:|---|
-| Stack cubes | `group_no_obs` | 4/4 | `stack_cubes_group_no_obs_20260528_224802.csv` |
-| Stack cubes | `ungroup_no_obs` | 4/4 | `stack_cubes_ungroup_no_obs_20260528_224800.csv` |
-| Stack cubes | `group_obs` | 4/4 | `stack_cubes_group_obs_20260528_224827.csv` |
-| Stack cubes | `ungroup_obs` | 4/4 | `stack_cubes_ungroup_obs_20260528_224633.csv` |
-
-## Cara Run
-
-Di WSL Ubuntu 22.04:
+```powershell
+wsl -d Ubuntu-22.04
+```
 
 ```bash
-cd /mnt/c/projek/MVP-CTAMP-ROBOT
+cd /mnt/c/projek
+git clone https://github.com/rafasoelistiono/MVP-CTAMP-ROBOT-V2.git MVP-CTAMP-ROBOT
+cd MVP-CTAMP-ROBOT
+python3 -m venv .venv
 source .venv/bin/activate
-python -m pytest -q
-python scripts/align_cubes_ompl_only.py --object group no obs --no-viewer
-python scripts/align_cubes_ompl_only.py --object ungroup no obs --no-viewer
-python scripts/align_tabung_ompl_only.py --object group no obs --no-viewer
-python scripts/align_tabung_ompl_only.py --object ungroup no obs --no-viewer
-```
-
-Varian obstacle yang masih didukung:
-
-```bash
-python scripts/align_cubes_ompl_only.py --object group obs --no-viewer
-python scripts/align_cubes_ompl_only.py --object ungroup obs --no-viewer
-python scripts/align_tabung_ompl_only.py --object group obs --no-viewer
-python scripts/align_tabung_ompl_only.py --object ungroup obs --no-viewer
-```
-
-Varian cube stacking:
-
-```bash
-python scripts/stack_cubes_ompl_only.py --object group no obs --no-viewer
-python scripts/stack_cubes_ompl_only.py --object ungroup no obs --no-viewer
-python scripts/stack_cubes_ompl_only.py --object group obs --no-viewer
-python scripts/stack_cubes_ompl_only.py --object ungroup obs --no-viewer
-```
-
-Dependency utama:
-
-```bash
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+cp .env.example .env
+python -m pytest -q
+```
+
+Validasi dependency:
+
+```bash
 python -c "from ompl import base, geometric; print('ompl ok')"
+python -c "import mujoco; print('mujoco ok')"
 python -c "import pinocchio, robot_descriptions; print('pinocchio ok')"
 ```
 
-Jika OMPL Python binding tidak tersedia, script OMPL-only berhenti dengan pesan
-setup yang eksplisit.
+### Setup Native Linux
 
-## Progress Refactor
-
-![Refactor success progress](docs/refactor_success_progress.svg)
-
-![Failure focus by refactor](docs/failure_focus_by_refactor.svg)
-
-### 1. Refactor 1 - Baseline awal
-
-Fokus awal:
-
-- Menjalankan task OMPL-only untuk cubes/tabung pada scene no-obstacle.
-- Mengukur titik awal sebelum perbaikan IK, grasp, dan feedback.
-- Membaca kegagalan dari log lama sebagai baseline kuantitatif.
-
-Pipeline saat itu:
-
-```text
-task script
-  -> target pose statis
-  -> IK MuJoCo DLS legacy
-  -> satu goal dominan
-  -> OMPL plan
-  -> execute trajectory
-  -> check_pick/check_place
+```bash
+git clone https://github.com/rafasoelistiono/MVP-CTAMP-ROBOT-V2.git
+cd MVP-CTAMP-ROBOT-V2
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+cp .env.example .env
+python -m pytest -q
 ```
 
-Masalah utama dari log:
+Jika `pip install ompl` gagal di distro tertentu, install OMPL Python binding
+melalui package/source build Linux lalu pastikan import ini berhasil:
 
-- `align_cubes_group_no_obs_20260526_232400.csv`: 3/4, `cube4` gagal pick.
-- `align_tabung_group_no_obs_20260526_231404.csv`: 2/4, `circle3` dan
-  `circle4` gagal pick.
-- Banyak kegagalan masih bercampur sebagai `ik_error_above_plan_limit`, padahal
-  beberapa sebenarnya collision/state invalid.
-- Grasp untuk object jauh atau borderline reach sering terlalu rendah atau
-  offset-nya tidak sesuai.
-- Log belum cukup eksplisit untuk membedakan:
-  - IK numeric error
-  - goal collision invalid
-  - OMPL no path
-  - trajectory execution collision
-  - object not lifted
-
-Notes dari capture log:
-
-- No-obstacle failure bukan karena obstacle avoidance.
-- Kegagalan cube paling sering muncul di object paling jauh (`cube4`).
-- Tabung/cylinder sensitif terhadap radial contact dan residual contact setelah
-  place.
-
-### 2. Refactor 2
-
-Fokus utama:
-
-- Membuat backend initialization eksplisit dan event log machine-readable.
-- Menambahkan Pinocchio sebagai IK primary dengan MuJoCo FK validation.
-- Menambahkan taxonomy failure reason untuk IK, OMPL, collision, dan execution.
-- Membuat Pinocchio dan MuJoCo konsisten frame.
-- Memastikan valid grasp contact tidak salah dianggap collision.
-- Mengurangi retry yang tidak produktif.
-- Menstabilkan grasp object jauh/borderline.
-
-Pipeline final:
-
-```text
-task script
-  -> target pose world MuJoCo
-  -> candidate generator
-      - nominal target
-      - small XY offsets
-      - radial/side offsets untuk object jauh/cylinder
-      - z variants untuk pregrasp/release
-  -> Pinocchio IK in Panda base frame
-  -> MuJoCo FK validation in world frame
-  -> fallback MuJoCo DLS per candidate jika Pinocchio FK gagal
-  -> joint limit validation
-  -> planner state validity with ignored target body for grasp/release
-  -> ranked valid candidates
-  -> OMPL RRTConnect plan
-  -> dense trajectory execution with collision checking
-  -> pick/place feedback
-  -> summary metrics + event logs
+```bash
+python -c "from ompl import base, geometric; print('ompl ok')"
 ```
 
-Perubahan teknis:
+### Isi `.env.example`
 
-- Startup log membedakan `IK_INIT=PINOCCHIO_OK`,
-  `IK_INIT=PINOCCHIO_FAILED`, `IK_INIT=MUJOCO_DLS_FALLBACK`,
-  `OMPL_INIT=OK`, dan `OMPL_INIT=FAILED`.
-- Failure taxonomy membedakan `ik_error_above_limit`,
-  `ik_goal_collision_invalid`, `ik_goal_state_invalid`, `ompl_timeout`,
-  `ompl_no_path_found`, `execution_failed`, dan `success`.
-- Event log ditambah kolom backend, candidate id, seed id, FK error,
-  state-validity result, OMPL result, dan execution result.
-- Target Pinocchio dikonversi dari MuJoCo world frame ke active arm base frame.
-- Setiap hasil Pinocchio tetap divalidasi ulang dengan MuJoCo FK.
-- Jika Pinocchio FK gagal threshold segmen, kandidat yang sama dicoba ulang
-  dengan MuJoCo DLS.
-- `planner.is_state_valid_q()` menerima `ignored_body_names`, sehingga target
-  object yang sedang digenggam boleh disentuh pada fase grasp/release.
-- Candidate valid per segment dibatasi agar run tidak menghabiskan waktu pada
-  kandidat redundant.
-- Retry pick dihentikan jika object jatuh di bawah meja atau keluar workspace.
-- Ranking grasp cube diberi penalti untuk offset besar, jadi center grasp lebih
-  diprioritaskan.
-- Grasp object jauh/borderline dinaikkan sedikit untuk menghindari
-  `table <-> finger` contact tanpa menonaktifkan collision checking.
+```dotenv
+# Simulation
+MODEL_FILE=models/panda.xml
+ENABLE_VIEWER=true
 
-Hasil setelah Refactor 2:
-
-- `align_cubes_group_no_obs_20260527_204557.csv`: 4/4.
-- `align_cubes_ungroup_no_obs_20260527_205745.csv`: 4/4.
-- `align_tabung_group_no_obs_20260527_204857.csv`: 4/4.
-- `align_tabung_ungroup_no_obs_20260527_205443.csv`: 4/4.
-
-Notes dari capture log:
-
-- Tahap observability awal sempat memperlihatkan frame mismatch Pinocchio:
-  target dikirim dalam frame world MuJoCo, sedangkan model Pinocchio memakai
-  frame base Panda. Insight ini digabung ke Refactor 2 karena langsung menjadi
-  perbaikan frame conversion.
-- OMPL berhasil membuat path untuk goal valid.
-- Failure yang tersisa sebelum final mostly bukan OMPL no-path, melainkan grasp
-  height/ranking dan target-object collision classification.
-- Setelah ignore-list dan far-grasp height fix, `cube4` group no-obs naik dari
-  3/4 ke 4/4.
-
-### 3. Refactor 3
-
-Fokus utama:
-
-- Membuat `group_obs` dan `ungroup_obs` cubes/tabung mencapai 4/4 seperti
-  no-obstacle.
-- Memisahkan objek `NEAR` dari objek `TOO_CLOSE`: `NEAR` dijalankan dengan
-  cautious high-clearance, bukan otomatis di-skip.
-- Memvalidasi ulang static obstacle mapping agar obstacle mengganggu jalur grab
-  di sekitar cluster object, tetapi masih berada di band reachability arm.
-- Mengurangi false failure dari kontak ringan `table <-> finger` saat grasp/lift
-  tanpa menonaktifkan collision checking.
-- Membuat place failure melakukan repick, bukan memanggil `place()` lagi ketika
-  tidak ada object yang sedang dipegang.
-
-Pipeline Refactor 3:
-
-```text
-task script group_obs / ungroup_obs
-  -> validated scene variant
-  -> target allocation dengan ceramic buffer lebih besar
-  -> precheck:
-      TOO_CLOSE -> skip/fail aman
-      NEAR      -> cautious execution
-      CLEAR     -> normal execution
-  -> IK candidates + MuJoCo FK validation
-  -> OMPL plan with collision checking
-  -> execution with small table-finger tolerance only
-  -> pick/place feedback
-  -> repick if place slip is recoverable
-  -> summary + event logs
-```
-
-Perubahan teknis:
-
-- `OBSTACLE_POSITIONS` untuk obstacle scene divalidasi ulang:
-  `obstacle1=(0.11, -0.60)` dan `obstacle2=(0.455, 0.27)`.
-  Ceramic 1 ditempatkan di sisi depan/negative-y agar tidak satu sisi dengan
-  ceramic 2. Ceramic 2 tetap di ujung belakang/positive-y, tetapi digeser
-  sedikit mundur. Pada `group_obs`, obstacle membuat `cube2` dan `circle4`
-  masuk status `NEAR`. Pada `ungroup_obs`, obstacle membuat `cube4` dan
-  `circle4` masuk status `NEAR`, sehingga arm harus memakai cautious
-  high-clearance, bukan jalur bebas obstacle.
-- `MIN_PICK_OBSTACLE_CLEARANCE` untuk obstacle scene diturunkan ke hard stop
-  `0.12 m`, sedangkan `CAUTIOUS_OBSTACLE_CLEARANCE` dinaikkan ke `0.28 m`.
-- Target allocation memakai ceramic buffer `0.13 m`, sehingga target tidak
-  dipilih terlalu dekat obstacle.
-- `TABLE_FINGER_CONTACT_TOLERANCE=0.005` mengizinkan penetrasi finger-table yang
-  sangat kecil pada fase grasp/lift, tetapi collision besar tetap gagal.
-- Cylinder retry grasp kembali memakai offset minimal `0.095`, karena log
-  menunjukkan profile ini yang berhasil mengangkat `circle2`.
-- Eksekusi align tabung sekarang mengisi target row dari kanan ke kiri
-  berdasarkan X target. Ini mengurangi risiko held cylinder menyapu row yang
-  sudah terisi saat membawa tabung ke slot paling kanan.
-- Profil grasp cylinder dibuat lebih rendah (`0.095 m`) dengan grip awal tetap
-  tidak terlalu ketat (`0.014`), sehingga `circle2` terangkat tanpa membuat
-  cylinder borderline seperti `circle4` lepas saat transit.
-- Fatal exception seperti obstacle displacement ditangkap di task script agar
-  summary CSV tetap tertulis.
-- Cube stacking memakai strategi tiga kubus base + satu kubus atas. Target atas
-  selalu di-refresh dari pose runtime kubus support, lalu release dibuat lebih
-  rendah (`release_lift=0.008`) dan bias X top cube diperkecil (`0.010 m`) agar
-  kubus tidak jatuh dari support setelah gripper terbuka.
-
-Hasil Refactor 3:
-
-![Refactor 3 obstacle progress](docs/refactor3_group_obs_progress.svg)
-
-- Sebelum Refactor 3, `align_cubes_group_obs_20260527_215406.csv`: 1/4.
-- Sebelum Refactor 3, `align_tabung_group_obs_20260527_205059.csv`: 1/4.
-- Setelah Refactor 3, `align_cubes_group_obs_20260528_222451.csv`: 4/4.
-- Setelah Refactor 3, `align_cubes_ungroup_obs_20260528_222638.csv`: 4/4.
-- Setelah Refactor 3, `align_tabung_group_obs_20260528_231917.csv`: 4/4.
-- Setelah Refactor 3, `align_tabung_ungroup_obs_20260528_232220.csv`: 4/4.
-- Cube stacking final:
-  `stack_cubes_group_no_obs_20260528_224802.csv`,
-  `stack_cubes_ungroup_no_obs_20260528_224800.csv`,
-  `stack_cubes_group_obs_20260528_224827.csv`, dan
-  `stack_cubes_ungroup_obs_20260528_224633.csv`: semua 4/4.
-
-Notes dari capture log:
-
-- Failure awal bukan karena OMPL tidak bisa plan. OMPL mayoritas solved, tetapi
-  object tidak pernah masuk pipeline karena `object_near_obstacle_safety_skip`.
-- Pada cubes, obstacle lama terlalu mudah menjadi static mapping problem:
-  object bisa slip ke dekat obstacle saat place. Posisi terbaru memindahkan
-  ceramic ke dua sisi berbeda sehingga tetap challenging, tetapi tidak
-  membuat target valid berubah menjadi `TOO_CLOSE`.
-- Pada tabung, retry cylinder terlalu tinggi setelah perubahan sementara,
-  sehingga `circle2` tidak terangkat. Mengembalikan retry offset `0.095`
-  memulihkan lift.
-- Setelah mapping dan execution guard diperbaiki, semua obstacle scene yang
-  diuji mencapai 100%. Obstacle tetap cukup dekat untuk memicu
-  `CAUTIOUS_OBJECT`, tetapi tidak masuk `TOO_CLOSE`.
-- Pada tabung `group_obs` dan `ungroup_obs`, satu object sempat gagal lift pada
-  attempt pertama. Retry pick menyelesaikan task, sehingga failure parsial
-  tidak berubah menjadi object failure.
-- Pada tabung no-obstacle, kegagalan terbaru muncul bukan sebagai OMPL no-path,
-  melainkan object lepas saat transit setelah row mulai terisi. Mengisi slot
-  kanan terlebih dahulu mengurangi crossing di atas object yang sudah selesai.
-- Pada stack cube, dua tower 2-level tidak stabil karena arm masih perlu
-  mengambil object berikutnya dan dapat mengganggu tower pertama. Pola tiga
-  base + satu top lebih cocok untuk pipeline OMPL saat ini karena support
-  target bisa divalidasi ulang setelah base benar-benar settle.
-
-## Insight dari Log
-
-1. No-obstacle failure bukan berarti planner obstacle avoidance buruk.
-   Pada run lama, no-obstacle gagal karena IK goal invalid, grasp terlalu rendah,
-   atau object tidak terangkat.
-
-2. Label failure harus memisahkan IK numeric dan planner validity.
-   Goal dengan FK bagus tetapi collision invalid tidak boleh disebut
-   `ik_error_above_limit`.
-
-3. Pinocchio harus selalu divalidasi dengan MuJoCo FK.
-   Pinocchio dan MuJoCo dapat memakai frame/model offset berbeda. FK validation
-   adalah guard utama sebelum goal masuk OMPL.
-
-4. Grasp target tidak sama dengan transit target.
-   Pada grasp/release, target object memang boleh disentuh. State-validity check
-   harus memakai ignore-list yang sama dengan OMPL.
-
-5. Object jauh seperti `cube4` perlu treatment khusus.
-   Di workspace borderline, sedikit kenaikan grasp height lebih benar daripada
-   melonggarkan collision checker.
-
-6. Retry harus berhenti jika object sudah tidak valid.
-   Jika object jatuh di bawah meja atau keluar reach, retry IK/OMPL hanya
-   membuang waktu dan memperkeruh log.
-
-7. Obstacle placement harus divalidasi sebagai bagian dari task generation.
-   Jika obstacle berada tepat di koridor pick-place, failure terlihat seperti
-   grasp/place issue padahal akar masalahnya static mapping.
-
-## Log dan Metrik
-
-Setiap run menghasilkan:
-
-- summary CSV: `logs/<task>_<scene>_<timestamp>.csv`
-- event CSV: `logs/<task>_<scene>_<timestamp>_events.csv`
-
-Kolom penting untuk tracing:
-
-- `stage`, `status`, `phase`, `failure_reason`
-- `object_id`, `held_object`, `object_xyz`, `object_z`
-- `target_xyz`, `actual_xyz`, `distance_to_target`
-- `ee_xyz`, `q`, `q_target`, `q_error_norm`, `finger_pos`
-- `backend`, `candidate_id`, `seed_id`
-- `planner`, `waypoints`, `pos_err`, `ori_err`, `iterations`
-- `joint_limit_valid`, `state_valid`, `state_invalid_reason`
-- `ompl_result`, `execution_result`
-- `collision_pair`, `contact_count`, `penetration`
-
-Urutan baca praktis:
-
-```text
-1. Cari status=FAILED.
-2. Baca stage + phase.
-3. Baca failure_reason.
-4. Jika IK_CANDIDATE, cek pos_err/ori_err/state_valid.
-5. Jika OMPL_PLAN, cek ompl_result dan goal_attempts di extra_json.
-6. Jika TRAJECTORY_EXEC, cek collision_pair dan waypoint.
-7. Cocokkan dengan CHECK_PICK/CHECK_PLACE untuk outcome object.
-```
-
-Data visualisasi dibuat dari log dan disimpan di:
-
-- `docs/refactor_success_progress.svg`
-- `docs/final_no_obs_success_matrix.svg`
-- `docs/final_obs_success_matrix.svg`
-- `docs/final_stack_success_matrix.svg`
-- `docs/refactor3_group_obs_progress.svg`
-- `docs/failure_focus_by_refactor.svg`
-- `docs/refactor_metrics.csv`
-
-Notebook analisis lengkap tersedia di:
-
-- `docs/ompl_log_analysis.ipynb`
-
-Notebook tersebut membuat dataframe terukur:
-
-- `summary_df`: ringkasan log kurasi yang masih dipakai.
-- `metrics_df`: metrik refactor dari `docs/refactor_metrics.csv`.
-- `progress_df`: progress Refactor 1, 2, dan 3.
-- `final_df`: matrix validasi final 8 command utama.
-- `failure_reason_df`: failure reason yang menjadi dasar perubahan.
-- `events_df`: event log untuk tracing IK/OMPL/execution.
-
-Output dataframe ringkas dari notebook disimpan di `docs/notebook_outputs/`.
-Gambar utama untuk README disimpan sebagai SVG di `docs/` agar tidak ada PNG/CSV
-besar yang redundant.
-
-## Konfigurasi Penting
-
-Default ada di `.env.example`:
-
-```env
+# OMPL motion planning
 IK_BACKEND=auto
 IK_REQUIRE_PINOCCHIO=false
 IK_PLAN_POS_ERR_LIMIT=0.020
@@ -422,41 +129,500 @@ IK_PLAN_ORI_ERR_LIMIT=0.35
 IK_PREGRASP_ORI_ERR_LIMIT=0.50
 MAX_VALID_IK_CANDIDATES=6
 MAX_IK_ATTEMPTS_PER_SEGMENT=80
+MIN_PICK_OBJECT_Z=0.70
+MAX_PICK_OBJECT_XY_DISTANCE=0.92
 OMPL_ENABLED=true
 OMPL_REQUIRED=false
 OMPL_PLANNER_NAME=RRTConnect
+OMPL_FRAGILE_PLANNER_NAME=BITstar
 OMPL_TIME_LIMIT=6.0
+OMPL_STATE_VALIDITY_RESOLUTION=0.004
+OMPL_SAMPLER_RANGE=0.08
+OMPL_WAYPOINT_STEP=0.010
+OMPL_GOAL_TOLERANCE=0.001
+
+# Execution safety
 USE_IK_FALLBACK=false
+SETTLE_STEPS_PER_WAYPOINT=14
+FINAL_SETTLE_STEPS=40
 MIN_PICK_OBSTACLE_CLEARANCE=0.18
 CAUTIOUS_OBSTACLE_CLEARANCE=0.24
+FINGER_MOVABLE_CONTACT_TOLERANCE=0.018
 TABLE_FINGER_CONTACT_TOLERANCE=0.005
 CYLINDER_RETRY_MIN_GRASP_OFFSET=0.095
 CYLINDER_TIPPED_CENTER_Z=0.832
 CYLINDER_TIPPED_GRASP_OFFSET=0.075
 CYLINDER_TIPPED_GRIP=0.010
+ALLOW_MOVABLE_OBJECT_CONTACT=false
 ```
 
-Untuk production-style run, `USE_IK_FALLBACK=false` harus tetap dipertahankan
-agar arm tidak bypass OMPL.
+### Fungsi Setiap Env
 
-Untuk obstacle scene, task script menerapkan override aman:
-`MIN_PICK_OBSTACLE_CLEARANCE=0.12`, `CAUTIOUS_OBSTACLE_CLEARANCE=0.28`,
-`MAX_VALID_IK_CANDIDATES=8`, dan `OMPL_TIME_LIMIT=8.0`.
+| Env | Fungsi |
+|---|---|
+| `MODEL_FILE` | File XML MuJoCo yang dimuat oleh executor. Task script biasanya mengisi ini otomatis dari scene variant. |
+| `ENABLE_VIEWER` | `true` membuka MuJoCo viewer, `false` untuk headless/CI/WSL no-viewer. |
+| `IK_BACKEND` | `auto`, `pinocchio`, atau `mujoco_dls`. `auto` memakai Pinocchio bila tersedia dan fallback ke MuJoCo DLS. |
+| `IK_REQUIRE_PINOCCHIO` | Jika `true`, program gagal jika Pinocchio tidak tersedia. |
+| `IK_PLAN_POS_ERR_LIMIT` | Batas error posisi IK untuk gerak plan/release. |
+| `IK_PREGRASP_POS_ERR_LIMIT` | Batas error posisi IK untuk pregrasp yang lebih longgar. |
+| `IK_PLAN_ORI_ERR_LIMIT` | Batas error orientasi IK untuk plan/release. |
+| `IK_PREGRASP_ORI_ERR_LIMIT` | Batas error orientasi IK untuk pregrasp. |
+| `MAX_VALID_IK_CANDIDATES` | Jumlah maksimum kandidat IK valid yang dipakai untuk dicoba OMPL. |
+| `MAX_IK_ATTEMPTS_PER_SEGMENT` | Batas percobaan IK per segmen gerak. |
+| `MIN_PICK_OBJECT_Z` | Z minimum object agar masih dianggap layak dipick. |
+| `MAX_PICK_OBJECT_XY_DISTANCE` | Batas jarak XY object dari base robot untuk pick. |
+| `OMPL_ENABLED` | Mengaktifkan planner OMPL. |
+| `OMPL_REQUIRED` | Jika `true`, script berhenti bila OMPL tidak tersedia. |
+| `OMPL_PLANNER_NAME` | Planner utama untuk scene normal, default `RRTConnect`. |
+| `OMPL_FRAGILE_PLANNER_NAME` | Planner alternatif untuk scene fragile/obstacle. |
+| `OMPL_TIME_LIMIT` | Batas waktu planning OMPL per attempt. |
+| `OMPL_STATE_VALIDITY_RESOLUTION` | Resolusi state validity checking OMPL. |
+| `OMPL_SAMPLER_RANGE` | Range sampling planner. |
+| `OMPL_WAYPOINT_STEP` | Step interpolasi waypoint trajectory. |
+| `OMPL_GOAL_TOLERANCE` | Toleransi goal planner. |
+| `USE_IK_FALLBACK` | Fallback gerak langsung IK. Untuk task OMPL-only tetap `false`. |
+| `SETTLE_STEPS_PER_WAYPOINT` | Jumlah step simulasi setiap waypoint. |
+| `FINAL_SETTLE_STEPS` | Step simulasi tambahan setelah trajectory. |
+| `MIN_PICK_OBSTACLE_CLEARANCE` | Jarak minimum object ke obstacle sebelum pick dibatalkan. |
+| `CAUTIOUS_OBSTACLE_CLEARANCE` | Batas jarak untuk memakai mode high-clearance/cautious. |
+| `FINGER_MOVABLE_CONTACT_TOLERANCE` | Toleransi contact finger dengan movable object. |
+| `TABLE_FINGER_CONTACT_TOLERANCE` | Toleransi contact finger dengan table. |
+| `CYLINDER_RETRY_MIN_GRASP_OFFSET` | Offset grasp minimum untuk silinder pada retry. |
+| `CYLINDER_TIPPED_CENTER_Z` | Threshold Z untuk mendeteksi silinder/tube yang tipped. |
+| `CYLINDER_TIPPED_GRASP_OFFSET` | Offset grasp khusus untuk silinder tipped. |
+| `CYLINDER_TIPPED_GRIP` | Grip target khusus untuk silinder tipped. |
+| `ALLOW_MOVABLE_OBJECT_CONTACT` | Jika `false`, contact robot dengan object lain tetap dianggap unsafe kecuali target yang sedang diabaikan. |
 
-## Test
+### Daftar Script yang Bisa Dijalankan
+
+Test suite:
 
 ```bash
 python -m pytest -q
 ```
 
-Hasil terakhir di WSL Ubuntu 22.04 `.venv`: `13 passed`.
+Align cubes:
 
-Skip di Windows terjadi karena OMPL/Pinocchio tidak tersedia di interpreter
-aktif Windows, sedangkan WSL `.venv` sudah lengkap.
+```bash
+python scripts/align_cubes_ompl_only.py --object group no obs --no-viewer
+python scripts/align_cubes_ompl_only.py --object ungroup no obs --no-viewer
+python scripts/align_cubes_ompl_only.py --object group obs --no-viewer
+python scripts/align_cubes_ompl_only.py --object ungroup obs --no-viewer
+python scripts/align_cubes_ompl_only.py --object group long obs --no-viewer
+python scripts/align_cubes_ompl_only.py --object ungroup long obs --no-viewer
+```
 
-## HintCache — Adaptive Heuristic Learning
+Align tabung:
 
-Setelah Refactor 3, sistem ditambahkan modul pembelajaran adaptif bernama
+```bash
+python scripts/align_tabung_ompl_only.py --object group no obs --no-viewer
+python scripts/align_tabung_ompl_only.py --object ungroup no obs --no-viewer
+python scripts/align_tabung_ompl_only.py --object group obs --no-viewer
+python scripts/align_tabung_ompl_only.py --object ungroup obs --no-viewer
+python scripts/align_tabung_ompl_only.py --object group long obs --no-viewer
+python scripts/align_tabung_ompl_only.py --object ungroup long obs --no-viewer
+```
+
+Stack cubes:
+
+```bash
+python scripts/stack_cubes_ompl_only.py --object group no obs --no-viewer
+python scripts/stack_cubes_ompl_only.py --object ungroup no obs --no-viewer
+python scripts/stack_cubes_ompl_only.py --object group obs --no-viewer
+python scripts/stack_cubes_ompl_only.py --object ungroup obs --no-viewer
+```
+
+Separate groups:
+
+```bash
+python scripts/separate_groups_ompl_only.py --object group no obs --no-viewer
+python scripts/separate_groups_ompl_only.py --object ungroup no obs --no-viewer
+python scripts/separate_groups_ompl_only.py --object group obs --no-viewer
+python scripts/separate_groups_ompl_only.py --object ungroup obs --no-viewer
+```
+
+HintCache aktif secara default. Untuk baseline tanpa HintCache:
+
+```bash
+python scripts/align_cubes_ompl_only.py --object group obs --no-viewer --no-hint-cache
+```
+
+## 3. Step by Step Robot
+
+### Step 1 - Script Dipanggil dan Scene Dibuat
+
+Task dimulai dari script seperti `align_cubes_ompl_only.py`,
+`align_tabung_ompl_only.py`, atau `stack_cubes_ompl_only.py`. Script membaca
+argumen `--object`, menormalisasi scene key, lalu membuat XML scene variant.
+
+Bukti kode:
+
+```python
+# scripts/ctamp_task_utils.py:177
+def prepare_scene_variant(raw: str | Iterable[str] | None) -> Path:
+    scene_key = normalize_scene_key(raw)
+    _validate_variant(scene_key)
+    ...
+    inserts = [_goal_area_body()]
+    for object_name, pos in VARIANT_OBJECTS[scene_key].items():
+        inserts.append(_movable_body(object_name, pos))
+```
+
+Keputusan robot pada tahap ini adalah memilih world state yang akan dipakai:
+`group_no_obs`, `ungroup_no_obs`, `group_obs`, `ungroup_obs`, atau varian
+`long_obs`. Object dan obstacle tidak random pada script ini; posisinya
+ditentukan oleh `VARIANT_OBJECTS` dan `OBSTACLE_POSITIONS`.
+
+### Step 2 - Object Target Dipilih
+
+Untuk align cubes, object yang dipilih adalah body dengan class `cube`. Untuk
+align tabung, object yang dipilih adalah class `circle` atau `cylinder`. Untuk
+stack cubes, urutan target dibuat eksplisit agar tower selalu 4 layer:
+`cube1 -> cube2 -> cube3 -> cube4`.
+
+Bukti kode:
+
+```python
+# scripts/align_cubes_ompl_only.py:394
+cubes = [
+    obj for obj in world_state["movable_objects"]
+    if obj.get("class") == "cube"
+]
+
+# scripts/align_tabung_ompl_only.py:51
+cylinders = [
+    obj for obj in world_state["movable_objects"]
+    if obj.get("class") in {"circle", "cylinder"} or obj["id"].lower().startswith("circle")
+]
+
+# scripts/stack_cubes_ompl_only.py:65
+required_order = ["cube1", "cube2", "cube3", "cube4"]
+```
+
+Object tidak dipilih dari kamera atau sensor vision. Pipeline ini memakai scene
+simulator yang sudah diketahui.
+
+### Step 3 - Object Valid atau Tidak
+
+Object valid jika terdaftar di MuJoCo body map, bukan obstacle, masih berada di
+workspace konservatif, dan tidak terlalu dekat obstacle. Pada long obstacle,
+object yang akses sampingnya tertutup boleh diskip dengan alasan eksplisit.
+
+Bukti kode:
+
+```python
+# src/executor.py:1522
+if obj not in name_to_cube:
+    print(f"[exec] unknown object: {obj}")
+    _log_arm_state("PICK", "FAILED", object_id=obj, failure_reason="unknown_object")
+    return
+
+# scripts/align_cubes_ompl_only.py:408
+if long_obstacle_mode and obstacle_distance <= LONG_OBSTACLE_SIDE_ACCESS_BLOCKED_M:
+    skipped.append({
+        "failure_reason": "object_blocked_by_long_obstacle_side_access",
+    })
+    continue
+```
+
+Keputusan pada tahap ini:
+
+| Kondisi | Keputusan |
+|---|---|
+| Object tidak dikenal | Pick dibatalkan untuk object itu. |
+| Object `TOO_CLOSE` ke obstacle | Object diskip agar obstacle tidak tersenggol. |
+| Object `NEAR` obstacle | Object tetap dicoba dengan cautious high-clearance. |
+| Object `HARD` reach | Object diskip karena terlalu jauh secara konservatif. |
+
+### Step 4 - Target Goal Dibangun
+
+Align cubes dan tabung membuat target sejajar di goal area. Setelah refactor,
+target row dikunci pada `goal_y` dan pencarian target dibatasi di band Y sempit,
+supaya hasil akhir benar-benar lurus.
+
+Bukti kode:
+
+```python
+# scripts/align_cubes_ompl_only.py:446
+row_y = goal_y
+
+# scripts/align_cubes_ompl_only.py:452
+target_xy = _search_safe_target_xy(
+    base_x,
+    row_y,
+    radius,
+    world_state,
+    occupied,
+    y_min=row_y - ALIGN_TARGET_ROW_BAND_M,
+    y_max=row_y + ALIGN_TARGET_ROW_BAND_M,
+)
+```
+
+Untuk stack cubes, target bukan empat posisi terpisah. Semua cube memiliki XY
+yang sama di tengah goal area dan Z naik per layer.
+
+Bukti kode:
+
+```python
+# scripts/stack_cubes_ompl_only.py:65
+def _build_cube_stack_targets(scene_file: str):
+    """Build one four-layer cube tower: cube1 <- cube2 <- cube3 <- cube4."""
+```
+
+### Step 5 - Safety Policy Target
+
+Sebelum robot bergerak, target XY dicek agar berada di meja, reachable, tidak
+masuk inflated ceramic region, dan tidak overlap dengan object lain.
+
+Bukti kode:
+
+```python
+# scripts/align_cubes_ompl_only.py:116
+def _target_xy_ok(x: float, y: float, radius: float, world_state, occupied=()) -> bool:
+    table = world_state["table"]
+    if not (table["x_range"][0] < x < table["x_range"][1] and table["y_range"][0] < y < table["y_range"][1]):
+        return False
+    if not _reachable(x, y, world_state):
+        return False
+    if not _clear_from_ceramic(x, y, radius, world_state):
+        return False
+```
+
+Inflated ceramic region adalah obstacle yang diberi buffer radius tambahan.
+Robot tidak hanya menghindari radius asli obstacle, tetapi juga zona aman di
+sekitar obstacle.
+
+Bukti kode:
+
+```python
+# scripts/align_cubes_ompl_only.py:221
+"inflated_ceramic_regions": [
+    {"id": o["id"], "center_xy": o["position"][:2], "radius": o["radius"] + TARGET_CERAMIC_BUFFER_M}
+    for o in ceramic_obstacles
+]
+```
+
+### Step 6 - Robot Bergerak ke Object
+
+Robot tidak langsung turun ke object. Ia bergerak ke `GRASP_READY`, lalu ke
+pregrasp di atas object, baru turun ke grasp pose. Ini mengurangi risiko arm
+menyapu object lain dari samping.
+
+Bukti kode:
+
+```python
+# src/executor.py:1522
+if not _move_to_grasp_ready(f"before pick({obj})", grip=0.04):
+    _log_arm_state("PICK", "FAILED", phase="transit", failure_reason="move_to_grasp_ready_failed")
+    return
+
+# src/executor.py:1686
+pregrasp_xyz = cube_pos + np.array([0.0, 0.0, pregrasp_clearance])
+grasp_xyz = cube_pos + np.array([0.0, 0.0, grasp_offset])
+lift_xyz = cube_pos + np.array([0.0, 0.0, approach_clearance])
+```
+
+### Step 7 - IK Candidate dan Kontribusi Pinocchio
+
+Pinocchio dipakai sebagai IK backend cepat untuk mencari kandidat joint yang
+membawa end-effector ke target XYZ. Namun hasil Pinocchio tidak langsung
+dipercaya. Sistem tetap melakukan validasi FK ulang di MuJoCo. Jika hasil
+Pinocchio tidak cocok dengan frame/simulator MuJoCo, kandidat fallback ke
+MuJoCo DLS.
+
+Bukti kode:
+
+```python
+# src/executor.py:651
+def _pinocchio_ik_solve_to(
+    target_xyz,
+    q_seed: Optional[np.ndarray] = None,
+    steps: int = 180,
+    damping: float = 1e-4,
+    tol: float = 1e-4,
+):
+```
+
+```python
+# src/executor.py:742
+fk_pos_err, fk_ori_err, _ = _mujoco_fk_error(pin_q, target_xyz)
+if fk_pos_err <= max_pos and fk_ori_err <= max_ori:
+    return pin_q, pin_info
+```
+
+Kontribusi Pinocchio:
+
+- Mempercepat pencarian kandidat joint untuk target end-effector.
+- Memberi solusi awal yang sering cukup dekat untuk diteruskan ke OMPL.
+- Dipakai sebagai primary backend saat `IK_BACKEND=auto`.
+- Tetap aman karena divalidasi ulang oleh MuJoCo FK.
+
+Peran MuJoCo DLS:
+
+- Menjadi fallback ketika Pinocchio gagal FK validation.
+- Lebih dekat dengan simulator karena memakai state dan model MuJoCo.
+- Membantu kondisi yang membutuhkan orientasi/null-space lebih realistis.
+
+### Step 8 - Joint Limit dan Planner State Validity
+
+Setelah IK menghasilkan kandidat `q`, kandidat dicek terhadap joint limit dan
+state validity planner. Kandidat yang berada dalam collision atau melanggar
+joint limit tidak dikirim ke OMPL.
+
+Bukti kode:
+
+```python
+# src/executor.py:916
+joint_ok = joint_limits_valid(q, arm_ranges[:, 0], arm_ranges[:, 1])
+state_valid = planner.is_state_valid_q(q, ignored_body_names=ignored_body_names)
+reason = classify_ik_attempt(...)
+```
+
+### Step 9 - OMPL Planning
+
+OMPL merencanakan path joint-space dari konfigurasi arm saat ini ke kandidat
+goal joint. Jalur yang gagal akan dicoba ulang dengan kandidat/planner lain.
+
+Bukti kode:
+
+```python
+# src/executor.py:1130
+traj, info = planner.plan(
+    start_q=start_q,
+    goal_q=goal_q,
+    ignored_body_names=ignored_body_names,
+)
+```
+
+Keputusan pada tahap ini:
+
+| Kondisi OMPL | Keputusan |
+|---|---|
+| Path ditemukan | Trajectory dieksekusi. |
+| Path tidak ditemukan | Kandidat IK/planner berikutnya dicoba. |
+| Semua kandidat gagal | `MOVE_POSE` gagal dan task masuk retry/fail. |
+
+### Step 10 - Trajectory Execution dan Collision Check
+
+Trajectory dieksekusi waypoint demi waypoint. Selama eksekusi, contact dicek.
+Collision yang tidak diizinkan membuat trajectory gagal.
+
+Bukti kode:
+
+```python
+# src/executor.py:1043
+for waypoint_index, q in enumerate(traj):
+    ...
+    if not _check_live_collision(context=f"trajectory waypoint {waypoint_index}", ignored_body_names=ignored_body_names):
+        _log_arm_state("TRAJECTORY_EXEC", "FAILED", failure_reason=f"collision_at_waypoint_{waypoint_index}")
+        return False
+```
+
+Collision policy membedakan target object yang sedang dipegang dengan object
+lain. Target object boleh masuk ignored body pada fase grasp/release, tetapi
+obstacle dan object lain tetap dilindungi.
+
+Bukti kode:
+
+```python
+# src/collision_policy.py:112
+if env_body in self.ignored_body_names:
+    continue
+...
+return CollisionReport(valid=False, ...)
+```
+
+### Step 11 - Pick dan Verifikasi Grip
+
+Setelah arm sampai grasp pose, gripper ditutup, object diangkat, lalu `check_pick`
+memastikan Z object berada di atas threshold. Kalau object tidak terangkat,
+robot melakukan drop, settle, dan retry bila masih recoverable.
+
+Bukti kode:
+
+```python
+# src/executor.py:1727
+_log_arm_state("PICK", "GRIP_CLOSE", object_id=obj, phase="close_gripper")
+set_grip(grip_target, steps=320 if cautious_motion else 260)
+```
+
+```python
+# src/feedback.py:18
+def check_pick(model, data, cube_id):
+    mujoco.mj_forward(model, data)
+    z = float(data.xpos[cube_id][2])
+    return z > HELD_Z_THRESHOLD, round(z, 3)
+```
+
+### Step 12 - Membawa Object ke Goal Area
+
+Ketika object sudah terangkat, `place()` membawa object ke target goal. Untuk
+align task, target adalah slot row. Untuk stack task, target adalah posisi tower
+sesuai level.
+
+Bukti kode:
+
+```python
+# src/executor.py:1792
+def place(
+    x,
+    y,
+    obj=None,
+    target_z: float = 0.83,
+    release_lift: float = 0.06,
+    post_place_ignored_body_names: Optional[Sequence[str]] = None,
+):
+```
+
+### Step 13 - Release dan Verifikasi Task
+
+Setelah release, robot membuka gripper, mundur, dan feedback mengecek object
+berada pada posisi yang benar. Align task memakai validasi tambahan
+`CHECK_ALIGN_PLACE` supaya object benar-benar lurus dengan target row. Stack
+task memakai validasi tower agar empat cube benar-benar membentuk 4 lapisan.
+
+Bukti kode align:
+
+```python
+# scripts/align_cubes_ompl_only.py:185
+def _check_aligned_target(
+    executor,
+    object_id: str,
+    target_pose,
+    z_threshold: float = ALIGN_PLACED_Z_THRESHOLD_M,
+):
+```
+
+```python
+# scripts/align_cubes_ompl_only.py:797
+print(
+    f"[{index:02d}] CHECK_ALIGN_PLACE {'OK' if align_ok else 'FAIL'} "
+    f"x_error={align_details['x_error']:.4f} y_error={align_details['y_error']:.4f}"
+)
+```
+
+Bukti kode stack:
+
+```python
+# scripts/stack_cubes_ompl_only.py:65
+"""Build one four-layer cube tower: cube1 <- cube2 <- cube3 <- cube4."""
+```
+
+Jika validasi gagal, object tidak dihitung sukses. Sistem memasukkan object
+kembali ke retry selama attempt masih tersedia.
+
+```python
+# scripts/align_cubes_ompl_only.py:875
+print(
+    f"[ROUND {retry_round}] ALIGNMENT_RECHECK FAIL object={object_id} "
+    f"reason={item['failure_reason']} actual={item['actual_xyz']}"
+)
+```
+
+## 4. HintCache - Adaptive Heuristic Learning
+
+sistem ditambahkan modul pembelajaran adaptif bernama
 **HintCache** (`src/hint_cache.py`). Modul ini membaca event log dari run
 sebelumnya dan menghasilkan hint yang digunakan langsung pada run berikutnya,
 tanpa model ML eksternal.
@@ -467,19 +633,19 @@ Saat startup, `init_hint_cache(log_dir, scene_filter)` membaca semua file
 `*_events.csv` yang cocok dengan scene aktif. Data dibagi ke dalam
 **workspace bucket**:
 
-- **Reach bucket**: `near` (<0.5 m), `mid` (0.5–0.7 m), `far` (0.7–0.85 m), `borderline` (>0.85 m)
-- **Obstacle bucket**: `clear` (>0.28 m), `near` (0.12–0.28 m), `too_close` (<0.12 m)
+- **Reach bucket**: `near` (<0.5 m), `mid` (0.5-0.7 m), `far` (0.7-0.85 m), `borderline` (>0.85 m)
+- **Obstacle bucket**: `clear` (>0.28 m), `near` (0.12-0.28 m), `too_close` (<0.12 m)
 
 Dari data tersebut, HintCache menghasilkan tiga hint:
 
 | Hint | Fungsi |
 |---|---|
-| `preferred_backend()` | Skip Pinocchio untuk seluruh run jika tingkat FK-validation-failure ≥ 70% |
+| `preferred_backend()` | Skip Pinocchio untuk seluruh run jika tingkat FK-validation-failure >= 70% |
 | `pos_err_tolerance()` | Lebarkan batas penerimaan IK per bucket jika banyak kandidat "near miss" |
 | `preferred_grasp_profile()` | Pilih profil grasp dengan success rate tertinggi per `(obj_class, reach_bucket)` |
 
 Hint hanya aktif setelah minimal **5 data point** per bucket terkumpul
-(`MIN_SAMPLES`). Saat data belum cukup, sistem menggunakan default — jadi
+(`MIN_SAMPLES`). Saat data belum cukup, sistem menggunakan default - jadi
 run pertama tetap aman.
 
 ### Dampak Terukur
@@ -487,7 +653,7 @@ run pertama tetap aman.
 Pada scene `separate_groups_ungroup_obs`, Pinocchio FK validation gagal di
 68% dari semua IK attempt (631/929). Ini menyebabkan runtime 22.5 menit di
 run pertama. Dari run kedua, HintCache mendeteksi pola ini dan skip
-Pinocchio secara otomatis, memotong runtime menjadi ±8 menit.
+Pinocchio secara otomatis, memotong runtime menjadi +/-8 menit.
 
 ### Penggunaan
 
@@ -593,7 +759,6 @@ Checklist sesudah HintCache:
 - Bandingkan hasil.
   - Sukses yang diharapkan: lebih sedikit `IK_SOLVE BACKEND_FALLBACK`, lebih sedikit `CHECK_PICK FAILED`, dan object lebih cepat masuk `CHECK_PICK OK`.
 
-
 | Bagian Log | Sebelum HintCache | Sesudah HintCache |
 |---|---|---|
 | `HINT_CACHE` | Tidak ada, disabled, atau cold-start tanpa hint berarti | Ada `HINT_CACHE LOADED` dengan summary |
@@ -604,8 +769,64 @@ Checklist sesudah HintCache:
 | `CHECK_PICK` | Bisa gagal lalu retry profile berikutnya | Harapannya lebih cepat `OK` karena profile awal lebih cocok |
 | Validasi akhir | Tetap sama | Tetap sama, HintCache tidak melonggarkan success condition |
 
+## 5. Result
 
-## Visualisasi Data Performance HintCache
+### Performance HintCache
 
-![Perbandingan performa log tanpa dan dengan HintCache](docs/notebook_outputs/hintcache_performance_comparison.png)
+![Before after HintCache](docs/report_assets/hintcache_before_after.png)
+
+Gambar ini membandingkan run sebelum dan sesudah event `HINT_CACHE LOADED`
+terdeteksi pada event log. Metrik yang diplot adalah object success rate dan
+median duration.
+
+### Tren Error dari Waktu ke Waktu
+
+![Error trend from logs](docs/report_assets/error_trend_from_logs.png)
+
+Titik merah/hijau menunjukkan
+failure-event rate per run; garis hitam adalah rolling error rate; garis biru
+adalah rolling mean `pos_err` IK.
+
+### Matriks Success Terbaru
+
+![Latest success matrix](docs/report_assets/latest_success_matrix.png)
+
+Matriks ini mengambil run terbaru per task-scene dari summary CSV sebelum log
+dibersihkan.
+
+### Bukti Visual Task Sukses
+
+Align cube:
+
+![Align cube success](docs/align_cube_success.png)
+
+Align tabung:
+
+![Align tube success](docs/align_tube_success.png)
+
+Cube stack:
+
+![Cube stack success](docs/cube_stack_success.png)
+
+### Validasi Teknis Terakhir
+
+Validasi test suite setelah refactor:
+
+```bash
+python -m pytest -q
+# 17 passed
+```
+Validasi runtime WSL yang sudah dilakukan:
+
+| Task | Scene | Status |
+|---|---|---|
+| Align cubes | `group no obs` | `success=True`, `objects_moved=4` |
+| Align cubes | `group obs` | Summary mencapai `success=True`, `objects_moved=4` |
+| Align cubes | `ungroup obs` | `success=True`, `objects_moved=4` |
+| Align tabung | `group no obs` | `success=True`, `objects_moved=4` |
+| Align tabung | `group obs` | `success=True`, `objects_moved=4` |
+| Align tabung | `ungroup obs` | `success=True`, `objects_moved=4` |
+| Stack cubes | `group no obs` | `success=True`, 4 layer |
+| Stack cubes | `ungroup obs` | `success=True`, 4 layer |
+
 

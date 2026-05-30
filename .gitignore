@@ -7,3 +7,4 @@ logs/
 MUJOCO_LOG.TXT
 models/generated/
 venv/
+PROJECT_CONTEXT.txt

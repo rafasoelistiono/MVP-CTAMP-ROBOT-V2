@@ -51,6 +51,9 @@ class _NullViewer:
     def sync(self) -> None:
         pass
 
+    def close(self) -> None:
+        pass
+
 
 if CONFIG.enable_viewer:
     viewer = mujoco.viewer.launch_passive(model, data)
@@ -91,7 +94,7 @@ DEFAULT_PLANNER_NAME = CONFIG.ompl_planner_name
 DEFAULT_TIME_LIMIT = CONFIG.ompl_time_limit
 DEFAULT_SETTLE_STEPS_PER_WP = CONFIG.settle_steps_per_waypoint
 DEFAULT_FINAL_SETTLE_STEPS = CONFIG.final_settle_steps
-PICK_GRIP_SEQUENCE = (0.015, 0.011, 0.008)
+PICK_GRIP_SEQUENCE = (0.021, 0.018, 0.015)
 PICK_GRASP_OFFSET_SEQUENCE = (0.10, 0.10, 0.10)
 PICK_CLEARANCE_BONUS_SEQUENCE = (0.0, 0.035, 0.06)
 COMPACT_CYLINDER_PICK_GRIP_SEQUENCE = (0.014, 0.012, 0.010)
@@ -100,7 +103,7 @@ CYLINDER_RETRY_MIN_GRASP_OFFSET = float(os.getenv("CYLINDER_RETRY_MIN_GRASP_OFFS
 CYLINDER_TIPPED_CENTER_Z = float(os.getenv("CYLINDER_TIPPED_CENTER_Z", "0.832"))
 CYLINDER_TIPPED_GRASP_OFFSET = float(os.getenv("CYLINDER_TIPPED_GRASP_OFFSET", "0.075"))
 CYLINDER_TIPPED_GRIP = float(os.getenv("CYLINDER_TIPPED_GRIP", "0.010"))
-OBSTACLE_CAUTIOUS_CUBE_GRIP = float(os.getenv("OBSTACLE_CAUTIOUS_CUBE_GRIP", "0.011"))
+OBSTACLE_CAUTIOUS_CUBE_GRIP = float(os.getenv("OBSTACLE_CAUTIOUS_CUBE_GRIP", "0.018"))
 OBSTACLE_CAUTIOUS_CYLINDER_GRIP = float(os.getenv("OBSTACLE_CAUTIOUS_CYLINDER_GRIP", "0.012"))
 HELD_Z_THRESHOLD = 0.90
 IK_PLAN_POS_ERR_LIMIT = CONFIG.ik_plan_pos_err_limit
@@ -1493,6 +1496,29 @@ _held_grip_target: float = 0.015
 _pick_call_counts: dict[str, int] = {}
 
 
+def shutdown_runtime() -> None:
+    """Best-effort release for native simulator/planner objects before CLI exit."""
+    global _ompl_planner, _planner_by_arm, _live_collision_policy
+    global _PINOCCHIO_ROBOT, _PINOCCHIO_MODEL, _PINOCCHIO_DATA, _PINOCCHIO_FRAME_ID
+    global _hint_cache
+
+    try:
+        close = getattr(viewer, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+    _planner_by_arm.clear()
+    _ompl_planner = None
+    _live_collision_policy = None
+    _PINOCCHIO_ROBOT = None
+    _PINOCCHIO_MODEL = None
+    _PINOCCHIO_DATA = None
+    _PINOCCHIO_FRAME_ID = None
+    _hint_cache = None
+
+
 def pick(obj):
     global _held_object_name, _held_grip_target
 
@@ -1627,7 +1653,7 @@ def pick(obj):
             OBSTACLE_CAUTIOUS_CYLINDER_GRIP if is_circle else OBSTACLE_CAUTIOUS_CUBE_GRIP,
         )
         if not is_circle and obstacle_distance < 0.12:
-            grip_target = min(grip_target, 0.007)
+            grip_target = min(grip_target, 0.014)
             _log_arm_state(
                 "PICK_PROFILE",
                 "TIGHT_OBSTACLE_CUBE",

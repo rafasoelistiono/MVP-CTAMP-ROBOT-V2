@@ -35,6 +35,7 @@ from ctamp_task_utils import (
     normalize_scene_key,
     obstacle_mode_for_scene,
     prepare_scene_variant,
+    safe_process_exit,
     write_summary_csv,
 )
 
@@ -594,8 +595,9 @@ def main() -> int:
     print(f"csv_log={csv_path}")
     print(f"event_csv_log={event_csv_path}")
     flush_trace()
+    executor.shutdown_runtime()
     return 0 if not failed else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    safe_process_exit(main())

@@ -119,19 +119,19 @@
     </body>
     <body name="cube1" pos="-0.02 -0.46 0.83">
       <joint type="free" />
-      <geom type="box" size="0.03 0.03 0.03" mass="0.1" friction="2 1 0.5" contype="1" conaffinity="1" rgba="1 0 0 1" />
+      <geom type="box" size="0.036 0.036 0.03" mass="0.1" friction="2 1 0.5" contype="1" conaffinity="1" rgba="1 0 0 1" />
     </body>
-    <body name="cube2" pos="0.1 -0.46 0.83">
+    <body name="cube2" pos="0.1 -0.52 0.83">
       <joint type="free" />
-      <geom type="box" size="0.03 0.03 0.03" mass="0.1" friction="2 1 0.5" contype="1" conaffinity="1" rgba="0 1 0 1" />
+      <geom type="box" size="0.036 0.036 0.03" mass="0.1" friction="2 1 0.5" contype="1" conaffinity="1" rgba="0 1 0 1" />
     </body>
-    <body name="cube3" pos="0.22 -0.4 0.83">
+    <body name="cube3" pos="0.22 -0.48 0.83">
       <joint type="free" />
-      <geom type="box" size="0.03 0.03 0.03" mass="0.1" friction="2 1 0.5" contype="1" conaffinity="1" rgba="0 0 1 1" />
+      <geom type="box" size="0.036 0.036 0.03" mass="0.1" friction="2 1 0.5" contype="1" conaffinity="1" rgba="0 0 1 1" />
     </body>
-    <body name="cube4" pos="0.32 -0.34 0.83">
+    <body name="cube4" pos="0.32 -0.38 0.83">
       <joint type="free" />
-      <geom type="box" size="0.03 0.03 0.03" mass="0.1" friction="2 1 0.5" contype="1" conaffinity="1" rgba="1 1 0 1" />
+      <geom type="box" size="0.036 0.036 0.03" mass="0.1" friction="2 1 0.5" contype="1" conaffinity="1" rgba="1 1 0 1" />
     </body>
     <body name="circle1" pos="-0.02 0.24 0.84">
       <joint type="free" />

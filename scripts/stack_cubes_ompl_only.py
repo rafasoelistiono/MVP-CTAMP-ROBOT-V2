@@ -30,22 +30,36 @@ from align_cubes_ompl_only import (
     _terminal_pick_failure_reason,
 )
 from ctamp_task_utils import (
+    CUBE_HALF_EXTENTS,
     apply_conservative_motion_defaults,
     apply_scene_motion_defaults,
     make_event_log_path,
     normalize_scene_key,
     obstacle_mode_for_scene,
     prepare_scene_variant,
+    safe_process_exit,
     write_summary_csv,
 )
 
-CUBE_RADIUS_M = 0.043
-CUBE_HALF_SIZE_M = 0.03
+CUBE_RADIUS_M = math.hypot(CUBE_HALF_EXTENTS[0], CUBE_HALF_EXTENTS[1])
+CUBE_HALF_SIZE_M = CUBE_HALF_EXTENTS[2]
 STACK_XY_TOLERANCE_M = 0.045
 STACK_Z_TOLERANCE_M = 0.035
 STACK_UPPER_PLACE_X_BIAS_M = 0.0
-STACK_STABILIZE_MAX_XY_ERROR_M = 0.22
-STACK_STABILIZE_MAX_Z_ERROR_M = 0.20
+
+
+def _configure_stack_ready_pose(executor) -> None:
+    """Keep the ready pose above the central tower, not inside it."""
+    if not hasattr(executor, "HOME") or not hasattr(executor, "GRASP_READY"):
+        return
+    executor.GRASP_READY = executor.HOME.copy()
+    executor.log_event(
+        "STACK_READY_POSE",
+        "SET",
+        phase="stack_cubes",
+        target="HOME",
+        q=[round(float(v), 4) for v in executor.GRASP_READY],
+    )
 
 
 def _build_cube_stack_targets(scene_file: str):
@@ -100,8 +114,8 @@ def _build_cube_stack_targets(scene_file: str):
 
     table = world_state["table"]
     goal_x, goal_y, _ = world_state["goal_center"]
-    desired_base_x = goal_x - 0.20
-    desired_base_y = goal_y - 0.04
+    desired_base_x = goal_x
+    desired_base_y = goal_y
     base_xy = _search_safe_target_xy(desired_base_x, desired_base_y, CUBE_RADIUS_M, world_state, [])
     if base_xy is None:
         skipped.append({
@@ -156,104 +170,6 @@ def _check_stack_place(executor, object_id: str, x: float, y: float, z: float):
     return xy_error <= STACK_XY_TOLERANCE_M and z_error <= STACK_Z_TOLERANCE_M, actual, xy_error, z_error
 
 
-def _free_joint_addresses(executor, object_id: str):
-    body_id = executor.name_to_cube[object_id]
-    if int(executor.model.body_jntnum[body_id]) <= 0:
-        return None, None
-    joint_id = int(executor.model.body_jntadr[body_id])
-    return int(executor.model.jnt_qposadr[joint_id]), int(executor.model.jnt_dofadr[joint_id])
-
-
-def _set_free_body_pose(executor, object_id: str, x: float, y: float, z: float) -> None:
-    qpos_addr, qvel_addr = _free_joint_addresses(executor, object_id)
-    if qpos_addr is None:
-        return
-    executor.data.qpos[qpos_addr:qpos_addr + 3] = [x, y, z]
-    executor.data.qpos[qpos_addr + 3:qpos_addr + 7] = [1.0, 0.0, 0.0, 0.0]
-    if qvel_addr is not None:
-        executor.data.qvel[qvel_addr:qvel_addr + 6] = 0.0
-
-
-def _stack_prefix_targets(moved_prefix: list[str], slots_by_object: dict, table_top: float):
-    if not moved_prefix:
-        return {}
-    base_slot = slots_by_object[moved_prefix[0]]
-    base_x, base_y = [float(v) for v in base_slot["target_pose"][:2]]
-    base_z = table_top + CUBE_HALF_SIZE_M
-    targets = {}
-    for level, object_id in enumerate(moved_prefix):
-        targets[object_id] = (
-            base_x,
-            base_y,
-            base_z + level * 2.0 * CUBE_HALF_SIZE_M,
-        )
-    return targets
-
-
-def _can_stabilize_stack_prefix(executor, moved_prefix: list[str], slots_by_object: dict, table_top: float) -> bool:
-    targets = _stack_prefix_targets(moved_prefix, slots_by_object, table_top)
-    for object_id, (x, y, z) in targets.items():
-        pos = _runtime_object_pose(executor, object_id)
-        xy_error = float(math.dist(pos[:2], (x, y)))
-        z_error = abs(float(pos[2]) - z)
-        if xy_error > STACK_STABILIZE_MAX_XY_ERROR_M or z_error > STACK_STABILIZE_MAX_Z_ERROR_M:
-            return False
-    return True
-
-
-def _stabilize_stack_prefix(
-    executor,
-    moved_prefix: list[str],
-    slots_by_object: dict,
-    table_top: float,
-    log_event_fn=None,
-    phase: str = "post_place",
-    force: bool = False,
-) -> bool:
-    if not force and not _can_stabilize_stack_prefix(executor, moved_prefix, slots_by_object, table_top):
-        return False
-
-    targets = _stack_prefix_targets(moved_prefix, slots_by_object, table_top)
-    for object_id, (x, y, z) in targets.items():
-        _set_free_body_pose(executor, object_id, x, y, z)
-        slot = slots_by_object[object_id]
-        slot["target_pose"][0] = round(x, 4)
-        slot["target_pose"][1] = round(y, 4)
-        slot["target_pose"][2] = round(z, 4)
-
-    executor.mujoco.mj_forward(executor.model, executor.data)
-    if log_event_fn is not None:
-        log_event_fn(
-            "STACK_STABILIZE",
-            "OK",
-            phase=phase,
-            moved_prefix=list(moved_prefix),
-            targets={
-                object_id: [round(x, 4), round(y, 4), round(z, 4)]
-                for object_id, (x, y, z) in targets.items()
-            },
-        )
-    return True
-
-
-def _reset_object_to_source(executor, object_id: str, world_state: dict, log_event_fn=None, phase: str = "pick_retry") -> bool:
-    source = next((obj for obj in world_state["movable_objects"] if obj["id"] == object_id), None)
-    if source is None:
-        return False
-    x, y, z = [float(v) for v in source["position"][:3]]
-    _set_free_body_pose(executor, object_id, x, y, z)
-    executor.mujoco.mj_forward(executor.model, executor.data)
-    if log_event_fn is not None:
-        log_event_fn(
-            "OBJECT_RESET",
-            "OK",
-            object_id=object_id,
-            phase=phase,
-            target_xyz=[round(x, 4), round(y, 4), round(z, 4)],
-        )
-    return True
-
-
 def _refresh_supported_target_from_base(executor, slot: dict) -> None:
     support = slot.get("support_object_id")
     if not support:
@@ -272,6 +188,68 @@ def _refresh_children_after_base_place(executor, base_object_id: str, slots_by_o
         slot["target_pose"][0] = round(float(base_pos[0]), 4)
         slot["target_pose"][1] = round(float(base_pos[1]), 4)
         slot["target_pose"][2] = round(float(base_pos[2] + 2.0 * CUBE_HALF_SIZE_M), 4)
+
+
+def _expected_stack_pose(executor, slot: dict, table_top: float):
+    support = slot.get("support_object_id")
+    if support:
+        support_pos = _runtime_object_pose(executor, support)
+        return (
+            float(support_pos[0]),
+            float(support_pos[1]),
+            float(support_pos[2] + 2.0 * CUBE_HALF_SIZE_M),
+        )
+    x, y = [float(v) for v in slot["target_pose"][:2]]
+    return x, y, float(table_top + CUBE_HALF_SIZE_M)
+
+
+def _check_stack_slot(executor, object_id: str, slots_by_object: dict, table_top: float):
+    x, y, z = _expected_stack_pose(executor, slots_by_object[object_id], table_top)
+    return _check_stack_place(executor, object_id, x, y, z)
+
+
+def _validate_moved_stack(
+    executor,
+    moved: list[str],
+    slots_by_object: dict,
+    table_top: float,
+    failure_reason: str = "placed_stack_disturbed",
+):
+    invalid = []
+    for object_id in moved:
+        ok, actual, xy_error, z_error = _check_stack_slot(executor, object_id, slots_by_object, table_top)
+        if not ok:
+            invalid.append({
+                "object_id": object_id,
+                "stage": "stack_integrity",
+                "failure_reason": failure_reason,
+                "actual": actual,
+                "xy_error": round(xy_error, 4),
+                "z_error": round(z_error, 4),
+                "support_object_id": slots_by_object[object_id].get("support_object_id"),
+            })
+    return invalid
+
+
+def _log_stack_integrity_failures(log_event_fn, invalid_items: list[dict], phase: str) -> None:
+    for item in invalid_items:
+        log_event_fn(
+            "STACK_INTEGRITY",
+            "FAILED",
+            object_id=item["object_id"],
+            phase=phase,
+            actual_xyz=item["actual"],
+            distance_to_target=item["xy_error"],
+            z_error=item["z_error"],
+            failure_reason=item["failure_reason"],
+            support_object_id=item["support_object_id"],
+        )
+
+
+def _rebuild_order_after_disturbance(move_order: list[str], invalid_items: list[dict]) -> list[str]:
+    invalid_ids = {item["object_id"] for item in invalid_items}
+    first_invalid_index = min(index for index, object_id in enumerate(move_order) if object_id in invalid_ids)
+    return move_order[first_invalid_index:]
 
 
 def _check_four_layer_tower_final(executor, moved: list[str], slots_by_object: dict, table_top: float):
@@ -312,7 +290,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Stack four cubes into one vertical four-layer tower using OMPL + MuJoCo collision checking only."
     )
-    parser.add_argument("--object", nargs="+", default=["group", "no", "obs"], help="Scene: group no obs, ungroup no obs, group obs, ungroup obs.")
+    parser.add_argument(
+        "--object",
+        nargs="+",
+        default=["group", "no", "obs"],
+        help="Scene: group no obs, ungroup no obs, group obs, ungroup obs, group long obs, ungroup long obs.",
+    )
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument("--no-hint-cache", action="store_true", help="Disable HintCache adaptive learning (use fixed defaults).")
@@ -367,6 +350,8 @@ def main() -> int:
     from exec_trace import log_event
     import feedback
 
+    _configure_stack_ready_pose(executor)
+
     if args.no_hint_cache:
         print("[STACK_CUBES] HintCache disabled (--no-hint-cache).")
     else:
@@ -391,9 +376,40 @@ def main() -> int:
     moved = []
     failed = list(skipped_precheck)
     max_pick_attempts = 3
+    max_stack_rebuild_attempts = 2
     pick_attempts = {object_id: 0 for object_id in move_order}
+    stack_rebuild_attempts = 0
     pending = list(move_order)
     object_index = {object_id: index for index, object_id in enumerate(move_order, start=1)}
+    table_top = float(world_state["table"]["z_top"])
+
+    def handle_stack_disturbance(invalid_items: list[dict], phase: str) -> bool:
+        nonlocal moved, pending, stack_rebuild_attempts
+        if not invalid_items:
+            return False
+        _log_stack_integrity_failures(log_event, invalid_items, phase)
+        if stack_rebuild_attempts < max_stack_rebuild_attempts:
+            stack_rebuild_attempts += 1
+            rebuild_order = _rebuild_order_after_disturbance(move_order, invalid_items)
+            rebuild_set = set(rebuild_order)
+            moved = [moved_id for moved_id in moved if moved_id not in rebuild_set]
+            pending = rebuild_order
+            log_event(
+                "STACK_REBUILD",
+                "RETRY_LATER",
+                phase=phase,
+                failure_reason="stack_disturbed_rebuild_from_current_pose",
+                attempt=stack_rebuild_attempts,
+                max_attempts=max_stack_rebuild_attempts,
+                rebuild_order=rebuild_order,
+                stable_prefix=moved,
+            )
+        else:
+            for item in invalid_items:
+                if not any(existing.get("object_id") == item["object_id"] for existing in failed):
+                    failed.append(item)
+            pending = []
+        return True
 
     round_id = 0
     while pending:
@@ -412,15 +428,15 @@ def main() -> int:
                 dependency_blocked.add(object_id)
                 continue
             if moved:
-                _stabilize_stack_prefix(
+                prefix_invalid = _validate_moved_stack(
                     executor,
                     moved,
                     slots_by_object,
-                    float(world_state["table"]["z_top"]),
-                    log_event_fn=log_event,
-                    phase=f"pre_pick_{object_id}",
-                    force=True,
+                    table_top,
+                    failure_reason="placed_stack_disturbed_before_next_pick",
                 )
+                if handle_stack_disturbance(prefix_invalid, phase=f"pre_pick_{object_id}"):
+                    break
             if support:
                 _refresh_supported_target_from_base(executor, slot)
 
@@ -467,24 +483,20 @@ def main() -> int:
                 terminal_reason = _terminal_pick_failure_reason(executor, object_id, world_state)
                 executor.drop(object_id)
                 _settle(executor, args.settle_after_place)
-                _stabilize_stack_prefix(
-                    executor,
-                    moved,
-                    slots_by_object,
-                    float(world_state["table"]["z_top"]),
-                    log_event_fn=log_event,
-                    phase=f"pick_retry_recover_{object_id}",
-                    force=True,
-                )
                 terminal_reason = terminal_reason or _terminal_pick_failure_reason(executor, object_id, world_state)
-                recoverable_pick_failure = terminal_reason in {None, "object_displaced_after_failed_pick"}
-                if recoverable_pick_failure and pick_attempts[object_id] < max_pick_attempts:
-                    _reset_object_to_source(
-                        executor,
-                        object_id,
-                        world_state,
-                        log_event_fn=log_event,
-                        phase=f"pick_retry_{object_id}",
+                unrecoverable_pick_failure = terminal_reason in {
+                    "object_displaced_below_table",
+                    "object_outside_robot_reach_after_displacement",
+                }
+                if not unrecoverable_pick_failure and pick_attempts[object_id] < max_pick_attempts:
+                    log_event(
+                        "DEFER_OBJECT",
+                        "RETRY_LATER",
+                        object_id=object_id,
+                        phase="pick",
+                        failure_reason="pick_failed_retry_from_current_pose",
+                        attempt=pick_attempts[object_id],
+                        max_attempts=max_pick_attempts,
                     )
                     pending.append(object_id)
                 else:
@@ -512,14 +524,6 @@ def main() -> int:
                 post_place_ignored_body_names=[],
             )
             _settle(executor, args.settle_after_place)
-            _stabilize_stack_prefix(
-                executor,
-                moved + [object_id],
-                slots_by_object,
-                float(world_state["table"]["z_top"]),
-                log_event_fn=log_event,
-                phase=f"post_place_{object_id}",
-            )
             x, y, z = [float(v) for v in slot["target_pose"][:3]]
             place_ok, actual, xy_error, z_error = _check_stack_place(executor, object_id, x, y, z)
             print(
@@ -537,10 +541,31 @@ def main() -> int:
                 z_error=round(z_error, 4),
                 failure_reason=None if place_ok else "object_not_on_stack_target",
             )
+            post_place_moved = moved + [object_id] if place_ok else list(moved)
+            post_place_invalid = _validate_moved_stack(
+                executor,
+                post_place_moved,
+                slots_by_object,
+                table_top,
+                failure_reason="placed_stack_disturbed_after_place",
+            )
+            if handle_stack_disturbance(post_place_invalid, phase=f"post_place_{object_id}"):
+                break
             if place_ok:
                 moved.append(object_id)
                 _refresh_children_after_base_place(executor, object_id, slots_by_object)
             elif pick_attempts[object_id] < max_pick_attempts:
+                log_event(
+                    "DEFER_OBJECT",
+                    "RETRY_LATER",
+                    object_id=object_id,
+                    phase="place",
+                    failure_reason="place_failed_retry_from_current_pose",
+                    attempt=pick_attempts[object_id],
+                    max_attempts=max_pick_attempts,
+                    actual_xyz=actual,
+                    target_xyz=[round(x, 4), round(y, 4), round(z, 4)],
+                )
                 pending.append(object_id)
             else:
                 failed.append({
@@ -561,15 +586,6 @@ def main() -> int:
                     })
             pending = []
 
-    _stabilize_stack_prefix(
-        executor,
-        moved,
-        slots_by_object,
-        float(world_state["table"]["z_top"]),
-        log_event_fn=log_event,
-        phase="final_validation",
-        force=True,
-    )
     final_failed = _check_four_layer_tower_final(
         executor,
         moved,
@@ -606,8 +622,9 @@ def main() -> int:
     print(f"csv_log={csv_path}")
     print(f"event_csv_log={event_csv_path}")
     flush_trace()
+    executor.shutdown_runtime()
     return 0 if not failed else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    safe_process_exit(main())

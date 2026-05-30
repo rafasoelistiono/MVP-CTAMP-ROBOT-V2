@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import sys
 import time
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -44,7 +45,7 @@ OBSTACLE_SCENE_MOTION_DEFAULTS = {
     # execution before the arm gets a chance to plan.
     "MIN_PICK_OBSTACLE_CLEARANCE": "0.10",
     "CAUTIOUS_OBSTACLE_CLEARANCE": "0.22",
-    "OBSTACLE_CAUTIOUS_CUBE_GRIP": "0.008",
+    "OBSTACLE_CAUTIOUS_CUBE_GRIP": "0.018",
     "OBSTACLE_CAUTIOUS_CYLINDER_GRIP": "0.012",
     "MAX_VALID_IK_CANDIDATES": "8",
     "OMPL_TIME_LIMIT": "8.0",
@@ -62,9 +63,19 @@ SCENE_ALIASES = {
     "group_obs": "group_obs",
     "group-obs": "group_obs",
     "group obs": "group_obs",
+    "group_long_obs": "group_long_obs",
+    "group-long-obs": "group_long_obs",
+    "group long obs": "group_long_obs",
+    "group_long": "group_long_obs",
+    "group long": "group_long_obs",
     "ungroup_obs": "ungroup_obs",
     "ungroup-obs": "ungroup_obs",
     "ungroup obs": "ungroup_obs",
+    "ungroup_long_obs": "ungroup_long_obs",
+    "ungroup-long-obs": "ungroup_long_obs",
+    "ungroup long obs": "ungroup_long_obs",
+    "ungroup_long": "ungroup_long_obs",
+    "ungroup long": "ungroup_long_obs",
 }
 
 GOAL_CENTER = (0.22, -0.06, 0.806)
@@ -73,6 +84,9 @@ GOAL_HALF_SIZE_Y = 0.20
 GOAL_EXCLUSION_MARGIN = 0.04
 COMPACT_CYLINDER_CENTER_Z = 0.84
 COMPACT_CYLINDER_SIZE = (0.026, 0.04)
+CUBE_HALF_EXTENTS = (0.036, 0.036, 0.03)
+DEFAULT_OBSTACLE_HALF_HEIGHT = 0.085
+LONG_OBSTACLE_HALF_HEIGHT = 0.32
 
 VARIANT_OBJECTS = {
     "group_no_obs": {
@@ -97,9 +111,9 @@ VARIANT_OBJECTS = {
     },
     "group_obs": {
         "cube1": (-0.02, -0.46, 0.83),
-        "cube2": (0.10, -0.46, 0.83),
-        "cube3": (0.22, -0.40, 0.83),
-        "cube4": (0.32, -0.34, 0.83),
+        "cube2": (0.10, -0.52, 0.83),
+        "cube3": (0.22, -0.48, 0.83),
+        "cube4": (0.32, -0.38, 0.83),
         "circle1": (-0.02, 0.24, COMPACT_CYLINDER_CENTER_Z),
         "circle2": (0.10, 0.32, COMPACT_CYLINDER_CENTER_Z),
         "circle3": (0.21, 0.20, COMPACT_CYLINDER_CENTER_Z),
@@ -112,10 +126,13 @@ VARIANT_OBJECTS = {
         "circle2": (0.34, -0.32, COMPACT_CYLINDER_CENTER_Z),
         "cube3": (0.00, 0.24, 0.83),
         "circle3": (0.16, 0.32, COMPACT_CYLINDER_CENTER_Z),
-        "cube4": (0.21, 0.20, 0.83),
+        "cube4": (0.14, 0.20, 0.83),
         "circle4": (0.18, 0.44, COMPACT_CYLINDER_CENTER_Z),
     },
 }
+
+VARIANT_OBJECTS["group_long_obs"] = dict(VARIANT_OBJECTS["group_obs"])
+VARIANT_OBJECTS["ungroup_long_obs"] = dict(VARIANT_OBJECTS["ungroup_obs"])
 
 OBSTACLE_POSITIONS = {
     # Refactor 3 obstacle mapping: obstacle1 and obstacle2 intentionally sit on
@@ -137,7 +154,14 @@ def normalize_scene_key(raw: str | Iterable[str] | None) -> str:
     key = " ".join(key.strip().lower().replace("-", " ").replace("_", " ").split())
     normalized = SCENE_ALIASES.get(key) or SCENE_ALIASES.get(key.replace(" ", "_"))
     if normalized is None:
-        valid = ", ".join(sorted({"group no obs", "ungroup no obs", "group obs", "ungroup obs"}))
+        valid = ", ".join(sorted({
+            "group no obs",
+            "ungroup no obs",
+            "group obs",
+            "ungroup obs",
+            "group long obs",
+            "ungroup long obs",
+        }))
         raise ValueError(f"unknown --object '{key}'. Valid: {valid}")
     return normalized
 
@@ -177,9 +201,11 @@ def prepare_scene_variant(raw: str | Iterable[str] | None) -> Path:
     inserts = [_goal_area_body()]
     for object_name, pos in VARIANT_OBJECTS[scene_key].items():
         inserts.append(_movable_body(object_name, pos))
-    if scene_key in {"group_obs", "ungroup_obs"}:
-        for obstacle_name, pos in OBSTACLE_POSITIONS.items():
-            inserts.append(_obstacle_body(obstacle_name, pos))
+    if obstacle_mode_for_scene(scene_key) == "obs":
+        half_height = _obstacle_half_height_for_scene(scene_key)
+        fixed = scene_key.endswith("_long_obs")
+        for obstacle_name, pos in _obstacle_positions_for_scene(scene_key).items():
+            inserts.append(_obstacle_body(obstacle_name, pos, half_height=half_height, fixed=fixed))
 
     for offset, body in enumerate(inserts):
         worldbody.insert(link0_index + offset, body)
@@ -234,6 +260,20 @@ def write_summary_csv(task_name: str, scene_key: str, summary: dict, log_dir: st
     return out_path
 
 
+def safe_process_exit(code: int) -> None:
+    """
+    Exit after user-visible logs are flushed, bypassing native-library teardown.
+
+    MuJoCo, OMPL, GLFW, and Pinocchio are C/C++ backed modules. In WSL/headless
+    runs they can occasionally segfault during Python interpreter shutdown after
+    the task has already written its summary. os._exit avoids that destructor
+    phase; callers must flush logs before using this helper.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(int(code))
+
+
 def _summary_failure_reason(item) -> str:
     if isinstance(item, dict):
         reason = item.get("failure_reason")
@@ -270,6 +310,21 @@ def apply_scene_motion_defaults(scene_key: str) -> None:
         return
     for name, value in OBSTACLE_SCENE_MOTION_DEFAULTS.items():
         os.environ.setdefault(name, value)
+
+
+def _obstacle_half_height_for_scene(scene_key: str) -> float:
+    return LONG_OBSTACLE_HALF_HEIGHT if scene_key.endswith("_long_obs") else DEFAULT_OBSTACLE_HALF_HEIGHT
+
+
+def _obstacle_positions_for_scene(scene_key: str) -> dict[str, tuple[float, float, float]]:
+    if not scene_key.endswith("_long_obs"):
+        return dict(OBSTACLE_POSITIONS)
+    half_height = _obstacle_half_height_for_scene(scene_key)
+    center_z = GOAL_CENTER[2] + half_height
+    return {
+        name: (float(pos[0]), float(pos[1]), center_z)
+        for name, pos in OBSTACLE_POSITIONS.items()
+    }
 
 
 def _validate_variant(scene_key: str) -> None:
@@ -316,7 +371,8 @@ def _movable_body(name: str, pos: tuple[float, float, float]) -> ET.Element:
         "circle4": "0.3 0.9 0.2 1",
     }.get(name, "1 1 1 1")
     if name.startswith("cube"):
-        geom = f'<geom type="box" size="0.03 0.03 0.03" mass="0.1" friction="2 1 0.5" contype="1" conaffinity="1" rgba="{rgba}"/>'
+        half_x, half_y, half_z = CUBE_HALF_EXTENTS
+        geom = f'<geom type="box" size="{half_x} {half_y} {half_z}" mass="0.1" friction="2 1 0.5" contype="1" conaffinity="1" rgba="{rgba}"/>'
     else:
         radius, half_height = COMPACT_CYLINDER_SIZE
         geom = f'<geom type="cylinder" size="{radius} {half_height}" mass="0.08" friction="3 1.5 0.8" contype="1" conaffinity="1" rgba="{rgba}"/>'
@@ -330,12 +386,18 @@ def _movable_body(name: str, pos: tuple[float, float, float]) -> ET.Element:
     )
 
 
-def _obstacle_body(name: str, pos: tuple[float, float, float]) -> ET.Element:
+def _obstacle_body(
+    name: str,
+    pos: tuple[float, float, float],
+    half_height: float = DEFAULT_OBSTACLE_HALF_HEIGHT,
+    fixed: bool = False,
+) -> ET.Element:
+    joint = "" if fixed else '<joint type="free"/>'
     return ET.fromstring(
         f"""
         <body name="{name}" pos="{pos[0]} {pos[1]} {pos[2]}">
-          <joint type="free"/>
-          <geom type="cylinder" size="0.035 0.085" mass="0.4" friction="2 1 0.5" rgba="0.9 0.75 0.2 0.75" contype="1" conaffinity="1"/>
+          {joint}
+          <geom type="cylinder" size="0.035 {half_height}" mass="0.4" friction="2 1 0.5" rgba="0.9 0.75 0.2 0.75" contype="1" conaffinity="1"/>
         </body>
         """
     )
