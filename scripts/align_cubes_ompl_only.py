@@ -150,18 +150,20 @@ def _search_safe_target_xy(
     occupied=(),
     y_min: float = None,
     y_max: float = None,
+    x_min: float = None,
+    x_max: float = None,
 ):
     table = world_state["table"]
-    x_min, x_max = table["x_range"]
-    y_min_table, y_max_table = table["y_range"]
+    table_x_min, table_x_max = table["x_range"]
+    table_y_min, table_y_max = table["y_range"]
     candidates = []
     for ring in range(0, 7):
         for dx in range(-ring, ring + 1):
             for dy in range(-ring, ring + 1):
                 if ring and abs(dx) != ring and abs(dy) != ring:
                     continue
-                x = min(max(base_x + dx * 0.035, x_min + radius), x_max - radius)
-                y = min(max(base_y + dy * 0.035, y_min_table + radius), y_max_table - radius)
+                x = min(max(base_x + dx * 0.035, table_x_min + radius), table_x_max - radius)
+                y = min(max(base_y + dy * 0.035, table_y_min + radius), table_y_max - radius)
                 candidates.append((x, y))
 
     seen = set()
@@ -177,6 +179,10 @@ def _search_safe_target_xy(
         if y_min is not None and y < y_min:
             continue
         if y_max is not None and y > y_max:
+            continue
+        if x_min is not None and x < x_min:
+            continue
+        if x_max is not None and x > x_max:
             continue
         if _target_xy_ok(x, y, radius, world_state, occupied):
             return x, y

@@ -74,6 +74,11 @@ _plan_data = mujoco.MjData(model)
 
 HOME = np.array([0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, -0.7854])
 GRASP_READY = np.array([0.0, 0.529, 0.0, -1.98, 0.0, 2.495, -0.75])
+# Optional override for the inter-action PARK pose (where the arm waits between
+# pick/place transits). Defaults to GRASP_READY. Set this independently -- e.g.
+# to HOME -- to park the arm high and clear of placed objects WITHOUT changing
+# GRASP_READY, which also serves as a tuned IK null-space seed for low grasps.
+REST_POSE = None
 _DESIRED_Z = np.array([0.0, 0.0, -1.0])
 GRASP_OFFSET = 0.10
 APPROACH_CLEARANCE = 0.30
@@ -1391,11 +1396,16 @@ def _move_pose_safe(
 # SAFETY / GRIPPER HELPERS
 # =============================
 
+def _rest_target() -> np.ndarray:
+    """The pose the arm parks at between actions: REST_POSE if set, else GRASP_READY."""
+    return REST_POSE if REST_POSE is not None else GRASP_READY
+
+
 def _recover_to_safe_hover(ignored_body_names: Optional[Sequence[str]] = None) -> None:
     """Move away from table/contact states before retrying another pick."""
     log_event("RECOVERY", "START", phase="safe_hover", ignored_body_names=list(ignored_body_names or []))
     ok = _move_with_ompl(
-        goal_q=GRASP_READY,
+        goal_q=_rest_target(),
         grip=0.04,
         ignored_body_names=ignored_body_names,
         planner_name=DEFAULT_PLANNER_NAME,
@@ -1411,7 +1421,7 @@ def _recover_to_safe_hover(ignored_body_names: Optional[Sequence[str]] = None) -
     # Last-resort controller recovery. This is only used after releasing an
     # object, where the main risk is repeatedly starting near table contact.
     log_event("RECOVERY", "DIRECT_CTRL", phase="safe_hover")
-    _step_sim(260, q=GRASP_READY, grip=0.04)
+    _step_sim(260, q=_rest_target(), grip=0.04)
     log_event("RECOVERY", "OK", phase="safe_hover_direct")
 
 
@@ -1420,11 +1430,12 @@ def _move_to_grasp_ready(
     grip: float = 0.04,
     ignored_body_names: Optional[Sequence[str]] = None,
 ) -> bool:
-    if float(np.linalg.norm(current_q() - GRASP_READY)) < 0.05:
+    rest = _rest_target()
+    if float(np.linalg.norm(current_q() - rest)) < 0.05:
         return True
-    log_event("TRANSIT", "START", phase=reason, target="GRASP_READY")
+    log_event("TRANSIT", "START", phase=reason, target="REST_POSE")
     ok = _move_with_ompl(
-        goal_q=GRASP_READY,
+        goal_q=rest,
         grip=grip,
         ignored_body_names=ignored_body_names,
         planner_name=DEFAULT_PLANNER_NAME,
@@ -1433,7 +1444,7 @@ def _move_to_grasp_ready(
         settle_steps_per_wp=DEFAULT_SETTLE_STEPS_PER_WP,
         final_settle_steps=DEFAULT_FINAL_SETTLE_STEPS,
     )
-    log_event("TRANSIT", "OK" if ok else "FAILED", phase=reason, target="GRASP_READY")
+    log_event("TRANSIT", "OK" if ok else "FAILED", phase=reason, target="REST_POSE")
     return ok
 
 
