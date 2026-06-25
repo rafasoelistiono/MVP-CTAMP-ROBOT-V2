@@ -17,6 +17,7 @@ arena seam (closed-loop planner + region-membership scoring) sits on top.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -57,6 +58,18 @@ GOAL_Y_HALF = 0.20
 SEP_MARGIN = 0.02      # dead-zone half-width between the two rows (matches evaluator)
 CUBE_SPACING = 0.11
 CIRCLE_SPACING = 0.105
+# "Touches the strip": strip half-height (~0.025) + object half-width. Must match
+# the TidyEvaluator tolerances so the allocator only targets slots the evaluator
+# will credit.
+CUBE_ROW_TOL = 0.061
+CIRCLE_ROW_TOL = 0.051
+# Keep target slots within comfortable reach of the arm. Reach thresholds are
+# BORDERLINE 0.78 / HARD 0.82; placing/grasping is unreliable that far out, and
+# obstacles tend to shove slots toward the workspace edge. 0.76 sits just under
+# BORDERLINE and is wide enough that a full row of 4 objects still fits without
+# any one being pushed past it (a tighter cap backfires -> the last slot
+# overflows to the HARD edge).
+COMFORT_REACH_M = 0.76
 
 
 def _build_tidy_slots(world_state, goal_x, goal_y):
@@ -91,6 +104,12 @@ def _build_tidy_slots(world_state, goal_x, goal_y):
     occupied: list = []   # shared so cube and circle slots never overlap
     slots: dict = {}
     skipped: list = []
+    base_xy = world_state["robot"]["base_xy"]
+
+    def _max_comfortable_x(row_y):
+        """Largest x on this row line within COMFORT_REACH_M of the robot base."""
+        rem = COMFORT_REACH_M ** 2 - (row_y - base_xy[1]) ** 2
+        return base_xy[0] + math.sqrt(rem) if rem > 0 else base_xy[0]
 
     def _allocate(objs, group, row_y, y_lo, y_hi, z_off, spacing):
         eligible = []
@@ -104,7 +123,14 @@ def _build_tidy_slots(world_state, goal_x, goal_y):
                                 "failure_reason": "object_outside_conservative_reach"})
             else:
                 eligible.append(o)
-        start_x = goal_x - spacing * (len(eligible) - 1) / 2.0
+        # Pull the row toward the robot so the FARTHEST slot stays within
+        # comfortable reach (obstacles otherwise spread slots to the workspace
+        # edge, where grasp/IK is unreliable for every planner). Stay centred on
+        # the goal when reach allows it.
+        span = spacing * max(len(eligible) - 1, 0)
+        x_comfort = _max_comfortable_x(row_y)
+        center = min(goal_x, x_comfort - span / 2.0)
+        start_x = center - span / 2.0
         for i, o in enumerate(eligible):
             r = float(o.get("radius", 0.04))
             x_lo = goal_x - GOAL_X_HALF + r
@@ -112,8 +138,13 @@ def _build_tidy_slots(world_state, goal_x, goal_y):
             base_x = min(max(start_x + i * spacing, x_lo), x_hi)
             txy = _search_safe_target_xy(
                 base_x, row_y, r, world_state, occupied,
-                y_min=y_lo, y_max=y_hi, x_min=x_lo, x_max=x_hi,
+                y_min=y_lo, y_max=y_hi, x_min=x_lo, x_max=min(x_hi, x_comfort),
             )
+            if txy is None:  # nothing comfortable -> allow the full zone (a far slot beats skipping)
+                txy = _search_safe_target_xy(
+                    base_x, row_y, r, world_state, occupied,
+                    y_min=y_lo, y_max=y_hi, x_min=x_lo, x_max=x_hi,
+                )
             if txy is None:
                 skipped.append({"object_id": o["id"], "group": group,
                                 "failure_reason": "no_safe_in_zone_target"})
@@ -125,9 +156,12 @@ def _build_tidy_slots(world_state, goal_x, goal_y):
                 "target_pose": [round(x, 4), round(y, 4), round(table_z + z_off, 4), 1.0, 0.0, 0.0, 0.0],
             }
 
-    # Cubes -> lower half (y <= goal_y - margin); circles -> upper half.
-    _allocate(cubes, "cube", cube_row_y, goal_y - GOAL_Y_HALF, goal_y - SEP_MARGIN, 0.03, CUBE_SPACING)
-    _allocate(circles, "circle", circle_row_y, goal_y + SEP_MARGIN, goal_y + GOAL_Y_HALF, 0.04, CIRCLE_SPACING)
+    # Keep placements ON the row strip (within the evaluator's touch tolerance),
+    # not anywhere in the half -- so what the executor places is exactly what the
+    # evaluator credits (an object that can't fit on the strip is skipped, not
+    # dumped in a second row off the line).
+    _allocate(cubes, "cube", cube_row_y, cube_row_y - CUBE_ROW_TOL, cube_row_y + CUBE_ROW_TOL, 0.03, CUBE_SPACING)
+    _allocate(circles, "circle", circle_row_y, circle_row_y - CIRCLE_ROW_TOL, circle_row_y + CIRCLE_ROW_TOL, 0.04, CIRCLE_SPACING)
 
     move_order = sorted(
         slots.keys(),
@@ -146,8 +180,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Tidy-up / sort-by-type via the arena seam (swappable planner).")
     parser.add_argument("--object", nargs="+", default=["ungroup", "no", "obs"],
                         help="Scene: group no obs, ungroup no obs, group obs, ungroup obs, group long obs, ungroup long obs.")
-    parser.add_argument("--planner", default="scripted", choices=["scripted"],
-                        help="Planner under test (llm planner lands in Phase 2).")
+    parser.add_argument("--planner", default="scripted", choices=["scripted", "llm"],
+                        help="Planner under test: 'scripted' baseline or 'llm' (any chat model).")
+    parser.add_argument("--model", default="claude-opus-4-8",
+                        help="Model id for --planner llm (e.g. claude-opus-4-8, claude-sonnet-4-6, gpt-4o, gpt-4.1).")
+    parser.add_argument("--provider", default=None, choices=["anthropic", "openai"],
+                        help="Override provider (default: inferred from --model).")
+    parser.add_argument("--no-thinking", action="store_true",
+                        help="Disable adaptive thinking (Anthropic LLM planner only; cheaper/faster).")
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument("--no-hint-cache", action="store_true")
@@ -185,8 +225,11 @@ def main() -> int:
     cube_row_y = goal_y + CUBE_ROW_OFFSET_Y
     circle_row_y = goal_y + CIRCLE_ROW_OFFSET_Y
 
-    object_ids = list(move_order)
-    class_by_id = {oid: slots_by_object[oid]["group"] for oid in object_ids}
+    # Score EVERY movable object: ones that can't be placed on a strip count as
+    # misses, rather than being silently dropped from the denominator.
+    all_objects = world_state["movable_objects"]
+    object_ids = [o["id"] for o in all_objects]
+    class_by_id = {o["id"]: ("cube" if o.get("class") == "cube" else "circle") for o in all_objects}
     target_by_id = {
         oid: (float(s["target_pose"][0]), float(s["target_pose"][1]), float(s["target_pose"][2]))
         for oid, s in slots_by_object.items()
@@ -213,10 +256,10 @@ def main() -> int:
         print(f"[ARENA_TIDY] Skipped (unreachable/blocked): {[s['object_id'] for s in skipped]}")
     for oid in object_ids:
         o = by_id[oid]
-        tx, ty, _ = target_by_id[oid]
+        slot = target_by_id.get(oid)
+        slot_str = f"slot=({slot[0]:.3f}, {slot[1]:.3f})" if slot else "NO STRIP SLOT (counts as miss)"
         print(f"  - {oid:>7} [{class_by_id[oid]:>6}] reach={_reach_distance_xy(o, world_state):.3f}m "
-              f"status={_reach_status(o, world_state)} obs={_obstacle_status(o, world_state)} "
-              f"-> slot=({tx:.3f}, {ty:.3f})")
+              f"status={_reach_status(o, world_state)} obs={_obstacle_status(o, world_state)} -> {slot_str}")
 
     import executor  # noqa: E402
     import feedback  # noqa: E402
@@ -256,10 +299,19 @@ def main() -> int:
         object_ids=object_ids,
         class_by_id=class_by_id,
         goal_x=float(goal_x),
-        goal_y=float(goal_y),
+        cube_row_y=float(cube_row_y),
+        circle_row_y=float(circle_row_y),
         goal_x_half=GOAL_X_HALF,
+        cube_row_tol_m=CUBE_ROW_TOL,
+        circle_row_tol_m=CIRCLE_ROW_TOL,
     )
-    planner = ScriptedTidyPlanner()
+    if args.planner == "llm":
+        from arena.llm import LLMPlanner, make_llm_client  # noqa: E402
+        client = make_llm_client(args.model, provider=args.provider, thinking=not args.no_thinking)
+        planner = LLMPlanner(client, log_event=log_event)
+        print(f"[ARENA_TIDY] LLM planner  : provider={args.provider or 'auto'} model={args.model}")
+    else:
+        planner = ScriptedTidyPlanner()
     task = TaskSpec("tidy_table", scene_key, GOAL_TEXT, max_steps=args.max_steps)
 
     log_event("TASK_CONTEXT", "START", phase="arena_tidy", scene=scene_key,

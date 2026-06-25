@@ -115,7 +115,10 @@ def run(
         if evaluator.is_goal_satisfied(snapshot):
             break
 
-        action = planner.act(obs)
+        try:
+            action = planner.act(obs)
+        except Exception as exc:  # an LLM planner must never crash the run
+            action = Action.stop(f"planner_error:{type(exc).__name__}:{exc}")
         if not isinstance(action, Action):
             action = Action.stop("planner_returned_non_action")
         if action.type is ActionType.STOP:

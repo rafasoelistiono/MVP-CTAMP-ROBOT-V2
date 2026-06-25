@@ -60,8 +60,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Cube stacking via the arena seam (swappable planner).")
     parser.add_argument("--object", nargs="+", default=["group", "no", "obs"],
                         help="Scene: group no obs, ungroup no obs, group obs, ungroup obs, group long obs, ungroup long obs.")
-    parser.add_argument("--planner", default="scripted", choices=["scripted"],
-                        help="Planner under test (llm planner lands in Phase 2).")
+    parser.add_argument("--planner", default="scripted", choices=["scripted", "llm"],
+                        help="Planner under test: 'scripted' baseline or 'llm' (any chat model).")
+    parser.add_argument("--model", default="claude-opus-4-8",
+                        help="Model id for --planner llm (e.g. claude-opus-4-8, claude-sonnet-4-6, gpt-4o, gpt-4.1).")
+    parser.add_argument("--provider", default=None, choices=["anthropic", "openai"],
+                        help="Override provider (default: inferred from --model).")
+    parser.add_argument("--no-thinking", action="store_true",
+                        help="Disable adaptive thinking (Anthropic LLM planner only; cheaper/faster).")
     parser.add_argument("--height", type=int, default=3, choices=[2, 3, 4],
                         help="Tower height. 3 is reliable; 4 is hard mode (the top cube is tippy).")
     parser.add_argument("--log-dir", default="logs")
@@ -154,7 +160,13 @@ def main() -> int:
         log_event=log_event,
     )
     evaluator = StackEvaluator(stack_order, REGION)
-    planner = ScriptedStackPlanner(stack_order, region=REGION)
+    if args.planner == "llm":
+        from arena.llm import LLMPlanner, make_llm_client  # noqa: E402
+        client = make_llm_client(args.model, provider=args.provider, thinking=not args.no_thinking)
+        planner = LLMPlanner(client, log_event=log_event)
+        print(f"[ARENA_STACK] LLM planner  : provider={args.provider or 'auto'} model={args.model}")
+    else:
+        planner = ScriptedStackPlanner(stack_order, region=REGION)
     task = TaskSpec("stack_cubes", scene_key, goal_text, max_steps=args.max_steps)
 
     log_event("TASK_CONTEXT", "START", phase="arena_stack", scene=scene_key,

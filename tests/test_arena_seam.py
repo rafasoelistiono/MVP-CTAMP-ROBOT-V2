@@ -130,7 +130,7 @@ def _tidy_setup():
     }
     env = FakeEnvironment(objects=objects, regions=regions, table_z=0.80, classes=classes)
     planner = ScriptedTidyPlanner()
-    evaluator = TidyEvaluator(list(objects), classes, TIDY_GOAL_X, _GOAL_Y)
+    evaluator = TidyEvaluator(list(objects), classes, TIDY_GOAL_X, TIDY_CUBE_ROW_Y, TIDY_CIRCLE_ROW_Y)
     task = TaskSpec("tidy_table", "ungroup_no_obs", "Sort by type.", max_steps=20)
     return task, planner, env, evaluator
 
@@ -145,7 +145,7 @@ def test_tidy_sorts_every_object_by_type():
 
 def test_tidy_evaluator_rejects_object_in_wrong_row():
     ev = TidyEvaluator(["cube1", "circle1"], {"cube1": "cube", "circle1": "circle"},
-                       TIDY_GOAL_X, _GOAL_Y)
+                       TIDY_GOAL_X, TIDY_CUBE_ROW_Y, TIDY_CIRCLE_ROW_Y)
     snap = WorldSnapshot(
         objects=(
             # cube in its own (cube) row -> tidied

@@ -132,17 +132,18 @@ class StackEvaluator:
 
 
 class TidyEvaluator:
-    """Goal: every object sorted into its type's HALF of the goal area.
+    """Goal: every object sitting ON its type's row strip.
 
-    'Tidy' means sorted into the right zone, not landed on an exact line: a cube
-    is tidied if it rests in the goal area's lower (cube) half; a circle/cylinder
-    if it rests in the upper (circle) half. A small dead-zone around the goal
-    centre keeps the two zones unambiguous, so a cube dumped on the circle side
-    still counts as wrong -- which is what makes this a sorting task rather than a
-    'shove everything into the box' task.
+    'Tidied' means the object's footprint overlaps the coloured row strip it
+    belongs to: a cube must touch the cube (red) strip, a circle/cylinder the
+    circle (blue) strip. An object dumped between the strips, in a second row off
+    the line, or outside the goal area does NOT count -- which matches the visual
+    "the cube is on the red line, the cylinder is on the blue line".
 
-    Zone membership (not proximity to a precomputed slot) keeps scoring robust to
-    where exactly the executor sets an object down, and identical across planners.
+    A strip is centred at its row_y with a half-height of ~0.025 m; the default
+    tolerances (cube 0.061, circle 0.051) are that half-height plus the object's
+    own half-width, i.e. "the object overlaps the strip". Membership is judged
+    from live positions, so scoring is identical across planners.
     """
 
     def __init__(
@@ -150,33 +151,30 @@ class TidyEvaluator:
         object_ids: Sequence[str],
         class_by_id: dict[str, str],
         goal_x: float,
-        goal_y: float,
+        cube_row_y: float,
+        circle_row_y: float,
         goal_x_half: float = 0.26,
-        goal_y_half: float = 0.20,
-        separation_margin_m: float = 0.02,
+        cube_row_tol_m: float = 0.061,
+        circle_row_tol_m: float = 0.051,
     ) -> None:
         self.object_ids = list(object_ids)
         self.class_by_id = dict(class_by_id)
         self.goal_x = goal_x
-        self.goal_y = goal_y
+        self.cube_row_y = cube_row_y
+        self.circle_row_y = circle_row_y
         self.goal_x_half = goal_x_half
-        self.goal_y_half = goal_y_half
-        self.separation_margin_m = separation_margin_m
+        self.cube_row_tol_m = cube_row_tol_m
+        self.circle_row_tol_m = circle_row_tol_m
 
     def region_for(self, object_id: str) -> str:
         return "cube_row" if self.class_by_id.get(object_id) == "cube" else "circle_row"
 
-    def _zone_ok(self, obj, klass: str) -> bool:
-        in_goal = (
-            obj.on_table
-            and abs(obj.position[0] - self.goal_x) <= self.goal_x_half
-            and abs(obj.position[1] - self.goal_y) <= self.goal_y_half
-        )
-        if not in_goal:
+    def _on_strip(self, obj, klass: str) -> bool:
+        if not (obj.on_table and abs(obj.position[0] - self.goal_x) <= self.goal_x_half):
             return False
         if klass == "cube":
-            return obj.position[1] <= self.goal_y - self.separation_margin_m
-        return obj.position[1] >= self.goal_y + self.separation_margin_m
+            return abs(obj.position[1] - self.cube_row_y) <= self.cube_row_tol_m
+        return abs(obj.position[1] - self.circle_row_y) <= self.circle_row_tol_m
 
     def placed_status(self, snapshot: WorldSnapshot) -> dict[str, bool]:
         by_id = {o.id: o for o in snapshot.objects}
@@ -185,7 +183,7 @@ class TidyEvaluator:
             obj = by_id.get(object_id)
             if obj is None:
                 continue
-            status[object_id] = self._zone_ok(obj, self.class_by_id.get(object_id, "cube"))
+            status[object_id] = self._on_strip(obj, self.class_by_id.get(object_id, "cube"))
         return status
 
     def is_goal_satisfied(self, snapshot: WorldSnapshot) -> bool:
